@@ -1,0 +1,17 @@
+[package]
+name = "stable-fragmented-buffer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parking_lot = "0.12"  # High-performance RwLock
+thiserror = "1.0"     # Error handling
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"          # Unix mmap
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "winnt"] }  # Windows VirtualAlloc
+
+[dev-dependencies]
+criterion = "0.5"     # Benchmarking
