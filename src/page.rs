@@ -77,10 +77,36 @@ pub(crate) struct Page {
 
 impl Page {
     /// Create a new page with the given size
+    ///
+    /// Uses uninitialized memory for performance - safe because:
+    /// 1. We track `used` atomically
+    /// 2. Only written regions are ever read
+    /// 3. Writes happen before reads via `used` counter
     pub fn new(id: u32, size: usize, generation: u32) -> Self {
+        // PERFORMANCE: Use MaybeUninit to skip zeroing
+        // This is safe because:
+        // - We never read uninitialized memory (tracked by `used`)
+        // - All data is written before being read
+        // - The `used` atomic ensures proper ordering
+        use std::mem::MaybeUninit;
+
+        let mut uninit_vec: Vec<MaybeUninit<u8>> = Vec::with_capacity(size);
+        unsafe {
+            uninit_vec.set_len(size);
+        }
+
+        // Convert to initialized (we promise to only read written parts)
+        let data = unsafe {
+            // SAFETY: We will only ever read from regions that have been written to,
+            // as tracked by the `used` atomic counter. The memory is allocated and
+            // has the correct size, we just skip the zeroing step.
+            std::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(uninit_vec)
+        }
+        .into_boxed_slice();
+
         Self {
             id,
-            data: vec![0u8; size].into_boxed_slice(),
+            data,
             used: AtomicUsize::new(0),
             generation,
             entries: parking_lot::RwLock::new(Vec::new()),
