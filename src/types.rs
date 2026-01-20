@@ -97,17 +97,6 @@ impl BlobHandle {
     }
 }
 
-/// Storage backend mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendMode {
-    /// Memory-efficient segmented storage (Vec of heap-allocated pages)
-    Segmented,
-
-    /// Performance-heavy virtual memory (mmap/VirtualAlloc)
-    /// Note: Not yet implemented
-    Virtual,
-}
-
 /// Configuration for the blob store
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -122,9 +111,6 @@ pub struct Config {
 
     /// Default TTL for stored data (milliseconds, default: 30000)
     pub default_ttl_ms: u64,
-
-    /// Storage backend mode
-    pub backend_mode: BackendMode,
 }
 
 impl Default for Config {
@@ -134,7 +120,6 @@ impl Default for Config {
             prefetch_threshold: 0.8,    // 80%
             decay_timeout_ms: 5000,     // 5 seconds
             default_ttl_ms: 30000,      // 30 seconds
-            backend_mode: BackendMode::Segmented,
         }
     }
 }
@@ -147,18 +132,16 @@ impl Config {
             prefetch_threshold: 0.8,
             decay_timeout_ms: 7000,
             default_ttl_ms: 30000,
-            backend_mode: BackendMode::Segmented, // Will be Virtual when implemented
         }
     }
 
     /// Create a memory-optimized configuration
     pub fn memory_efficient() -> Self {
         Self {
-            page_size: 512 * 1024, // 512KB
-            prefetch_threshold: 0.90,   // 90% - less aggressive prefetch
-            decay_timeout_ms: 1000,     // 1 second - faster cleanup
+            page_size: 512 * 1024,    // 512KB
+            prefetch_threshold: 0.90, // 90% - less aggressive prefetch
+            decay_timeout_ms: 1000,   // 1 second - faster cleanup
             default_ttl_ms: 30000,
-            backend_mode: BackendMode::Segmented,
         }
     }
 }

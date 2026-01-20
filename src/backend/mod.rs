@@ -20,4 +20,3 @@ pub(crate) trait StorageBackend: Send + Sync {
 }
 
 pub mod segmented;
-pub mod virtual_mem;

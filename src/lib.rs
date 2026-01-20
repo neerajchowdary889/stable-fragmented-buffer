@@ -39,7 +39,7 @@ mod store;
 mod types;
 
 pub use store::{BlobStats, PinnedBlobStore};
-pub use types::{BackendMode, BlobError, BlobHandle, Config};
+pub use types::{BlobError, BlobHandle, Config};
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::backend::{segmented::SegmentedBackend, StorageBackend};
-use crate::types::{BackendMode, BlobError, BlobHandle, Config, Result};
+use crate::types::{BlobError, BlobHandle, Config, Result};
 
 /// The main blob store providing pointer-stable storage
 pub struct PinnedBlobStore {
@@ -23,13 +23,8 @@ pub struct PinnedBlobStore {
 impl PinnedBlobStore {
     /// Create a new blob store with the given configuration
     pub fn new(config: Config) -> Result<Self> {
-        let backend: Box<dyn StorageBackend> = match config.backend_mode {
-            BackendMode::Segmented => Box::new(SegmentedBackend::new()),
-            BackendMode::Virtual => {
-                // TODO: Implement virtual memory backend
-                return Err(BlobError::OutOfMemory);
-            }
-        };
+        // Use Segmented backend (heap-allocated pages with MaybeUninit optimization)
+        let backend: Box<dyn StorageBackend> = Box::new(SegmentedBackend::new());
 
         let store = Self {
             backend: Arc::new(RwLock::new(backend)),
