@@ -95,6 +95,42 @@ impl BlobHandle {
 
         now - self.timestamp
     }
+
+    // Public getter methods for external access
+    /// Get the starting page ID
+    pub fn page_id(&self) -> u32 {
+        self.page_id
+    }
+
+    /// Get the offset within the starting page (in bytes)
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Get the size of the stored data (in bytes)
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Get the generation counter
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Get the ending page ID
+    pub fn end_page_id(&self) -> u32 {
+        self.end_page_id
+    }
+
+    /// Get the total size across all pages
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    /// Get the creation timestamp (milliseconds since UNIX epoch)
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
 }
 
 /// Configuration for the blob store

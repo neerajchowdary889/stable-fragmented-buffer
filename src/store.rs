@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::backend::{segmented::SegmentedBackend, StorageBackend};
+use crate::profiling::Profiler;
 use crate::types::{BlobError, BlobHandle, Config, Result};
 
 /// The main blob store providing pointer-stable storage
@@ -18,6 +19,9 @@ pub struct PinnedBlobStore {
 
     /// Global generation counter
     generation_counter: AtomicU32,
+
+    /// Profiler for tracking metrics
+    profiler: Profiler,
 }
 
 impl PinnedBlobStore {
@@ -31,6 +35,7 @@ impl PinnedBlobStore {
             config,
             current_page: AtomicU32::new(0),
             generation_counter: AtomicU32::new(0),
+            profiler: Profiler::new(),
         };
 
         // Allocate the first page
@@ -48,7 +53,11 @@ impl PinnedBlobStore {
     fn allocate_page(&self, page_id: u32) -> Result<()> {
         let generation = self.generation_counter.fetch_add(1, Ordering::AcqRel);
         let mut backend = self.backend.write();
-        backend.allocate_page(page_id, self.config.page_size, generation)
+        let result = backend.allocate_page(page_id, self.config.page_size, generation);
+        if result.is_ok() {
+            self.profiler.record_page_allocated(self.config.page_size);
+        }
+        result
     }
 
     /// Append data to the blob store and return a stable handle
@@ -79,6 +88,9 @@ impl PinnedBlobStore {
                         // Success! Create handle
                         let handle =
                             BlobHandle::new(current_page_id, offset, size, page.generation);
+
+                        // Record append operation
+                        self.profiler.record_append(data.len());
 
                         // Check if we need to prefetch next page
                         if page.is_full(self.config.prefetch_threshold) {
@@ -186,6 +198,10 @@ impl PinnedBlobStore {
             }
         }
 
+        // Record multi-page append
+        self.profiler.record_append(data.len());
+        self.profiler.record_multi_page_span();
+
         // Create multi-page handle
         Ok(BlobHandle::new_multi_page(
             start_page_id.unwrap(),
@@ -221,8 +237,15 @@ impl PinnedBlobStore {
         }
 
         // Get data and return owned copy
-        page.get(handle.offset, handle.size)
-            .map(|slice| slice.to_vec())
+        let result = page
+            .get(handle.offset, handle.size)
+            .map(|slice| slice.to_vec());
+
+        if result.is_some() {
+            self.profiler.record_read(handle.size as usize);
+        }
+
+        result
     }
 
     /// Get multi-page data
@@ -261,6 +284,12 @@ impl PinnedBlobStore {
             }
         }
 
+        // Record multi-page read
+        if !result.is_empty() {
+            self.profiler.record_read(result.len());
+            self.profiler.record_multi_page_span();
+        }
+
         Some(result)
     }
 
@@ -273,6 +302,50 @@ impl PinnedBlobStore {
             }
         }
         false
+    }
+
+    /// >!REVIEW
+    /// Clean up acknowledged and expired entries
+    ///
+    /// This method scans all pages and marks entries that have been acknowledged
+    /// or expired for cleanup. Pages that become empty are marked for potential
+    /// reclamation based on the decay timeout.
+    ///
+    /// Returns the number of pages that were marked as empty.
+    pub fn cleanup_acknowledged(&self) -> usize {
+        let backend = self.backend.read();
+        let page_count = backend.page_count();
+        let mut empty_pages = 0;
+
+        // Scan all pages and mark empty ones
+        for page_id in 0..page_count as u32 {
+            if let Some(page) = backend.get_page(page_id) {
+                // Mark page as empty if all entries are acknowledged/expired
+                page.mark_empty_if_needed(self.config.default_ttl_ms);
+
+                // Check if page should be cleaned up
+                if page.is_empty(self.config.default_ttl_ms) {
+                    empty_pages += 1;
+
+                    // Record cleanup metrics
+                    let bytes_in_page = self.config.page_size - page.available_space();
+                    if bytes_in_page > 0 {
+                        self.profiler.record_page_cleanup(bytes_in_page);
+                    }
+                }
+            }
+        }
+
+        if empty_pages > 0 {
+            self.profiler.record_cleanup();
+        }
+
+        empty_pages
+    }
+
+    /// Get access to the profiler for metrics
+    pub fn profiler(&self) -> &Profiler {
+        &self.profiler
     }
 
     /// Get statistics about the blob store
