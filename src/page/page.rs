@@ -227,12 +227,21 @@ impl Page {
     /// Mark the page as empty and record timestamp
     pub fn mark_empty_if_needed(&self, ttl_ms: u64) {
         if self.is_empty(ttl_ms) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("System time before UNIX epoch")
-                .as_millis() as usize;
+            // Only set timestamp if it hasn't been set yet
+            let current = self.empty_since.load(Ordering::Acquire);
+            if current == 0 {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("System time before UNIX epoch")
+                    .as_millis() as usize;
 
-            self.empty_since.store(now, Ordering::Release);
+                let _ =
+                    self.empty_since
+                        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+            }
+        } else {
+            // Not empty anymore (maybe new data came in?), reset to 0
+            self.empty_since.store(0, Ordering::Release);
         }
     }
 

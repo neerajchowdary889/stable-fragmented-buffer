@@ -17,6 +17,9 @@ pub(crate) trait StorageBackend: Send + Sync {
 
     /// Remove a page (for decay/cleanup)
     fn remove_page(&mut self, id: u32) -> bool;
+
+    /// Get list of all currently active page IDs
+    fn active_page_ids(&self) -> Vec<u32>;
 }
 
 pub mod segmented;

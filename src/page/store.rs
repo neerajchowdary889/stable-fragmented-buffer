@@ -1,4 +1,7 @@
+use parking_lot::Mutex;
 use parking_lot::RwLock;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -14,8 +17,14 @@ pub struct PinnedBlobStore {
     /// Configuration
     config: Config,
 
-    /// Current active page ID
+    /// Current active page ID (The "Hot Head")
     current_page: AtomicU32,
+
+    /// Highest page ID ever allocated (High Water Mark)
+    high_water_mark: AtomicU32,
+
+    /// Min-Heap of recycled page IDs (prioritize filling holes)
+    free_pages: Mutex<BinaryHeap<Reverse<u32>>>,
 
     /// Global generation counter
     generation_counter: AtomicU32,
@@ -34,12 +43,14 @@ impl PinnedBlobStore {
             backend: Arc::new(RwLock::new(backend)),
             config,
             current_page: AtomicU32::new(0),
+            high_water_mark: AtomicU32::new(0),
+            free_pages: Mutex::new(BinaryHeap::new()),
             generation_counter: AtomicU32::new(0),
             profiler: Profiler::new(),
         };
 
         // Allocate the first page
-        store.allocate_page(0)?;
+        store.allocate_page(0)?; // This sets up Page 0
 
         Ok(store)
     }
@@ -49,7 +60,7 @@ impl PinnedBlobStore {
         Self::new(Config::default())
     }
 
-    /// Allocate a new page
+    /// Allocate a specific page ID (internal low-level alloc)
     fn allocate_page(&self, page_id: u32) -> Result<()> {
         let generation = self.generation_counter.fetch_add(1, Ordering::AcqRel);
         let mut backend = self.backend.write();
@@ -58,6 +69,29 @@ impl PinnedBlobStore {
             self.profiler.record_page_allocated(self.config.page_size);
         }
         result
+    }
+
+    /// Find and allocate the next appropriate page
+    ///
+    /// Strategy:
+    /// 1. Prefer picking a recycled page from `free_pages` (fill holes).
+    /// 2. If none, increment `high_water_mark` and allocate new space.
+    fn allocate_next_available_page(&self) -> Result<u32> {
+        let mut free_pages = self.free_pages.lock();
+
+        if let Some(Reverse(recycled_id)) = free_pages.pop() {
+            // Found a hole! Recycle it.
+            self.allocate_page(recycled_id)?;
+            return Ok(recycled_id);
+        }
+
+        // No holes, expand to new space
+        // fetch_add returns OLD value. So if HWM is 0, we get 0.
+        // But HWM tracks *Highest Allocated*.
+        // If current is 0. Next should be 1.
+        let next_id = self.high_water_mark.fetch_add(1, Ordering::AcqRel) + 1;
+        self.allocate_page(next_id)?;
+        Ok(next_id)
     }
 
     /// Append data to the blob store and return a stable handle
@@ -92,36 +126,18 @@ impl PinnedBlobStore {
                         // Record append operation
                         self.profiler.record_append(data.len());
 
-                        // Check if we need to prefetch next page
-                        if page.is_full(self.config.prefetch_threshold) {
-                            drop(backend); // Release read lock
-                            let next_page_id = current_page_id + 1;
-
-                            // Check if next page exists
-                            let backend_read = self.backend.read();
-                            if backend_read.get_page(next_page_id).is_none() {
-                                drop(backend_read);
-                                // Prefetch next page
-                                self.allocate_page(next_page_id)?;
-                            }
-                        }
+                        // Prefetch Check: If full, perform proactive allocation
+                        // Currently, for recycled implementation, proactive prefetch is tricky because "Next" isn't strictly +1.
+                        // We skip prefetch for now to ensure simple recycling logic (Lazy Allocation).
 
                         return Ok(handle);
                     }
                     Err(BlobError::PageFull) => {
-                        // Page is full, move to next page
+                        // Page is full, move to next available page
                         drop(backend); // Release read lock
 
-                        let next_page_id = current_page_id + 1;
-
-                        // Allocate next page if it doesn't exist
-                        let backend_read = self.backend.read();
-                        if backend_read.get_page(next_page_id).is_none() {
-                            drop(backend_read);
-                            self.allocate_page(next_page_id)?;
-                        } else {
-                            drop(backend_read);
-                        }
+                        // Allocate ANY free page (recycled or new)
+                        let next_page_id = self.allocate_next_available_page()?;
 
                         // Try to update current page pointer
                         let _ = self.current_page.compare_exchange(
@@ -131,15 +147,23 @@ impl PinnedBlobStore {
                             Ordering::Acquire,
                         );
 
-                        // Loop again to try appending to new page
+                        // Loop again to try appending to new (or updated) page
                         continue;
                     }
                     Err(e) => return Err(e),
                 }
             } else {
-                // Page doesn't exist, allocate it
+                // Page doesn't exist (maybe initialization race), allocate it
                 drop(backend);
-                self.allocate_page(current_page_id)?;
+                // Safe fallback: try to re-allocate current if missing, or move next
+                // Just moving to next is safer
+                let next_page_id = self.allocate_next_available_page()?;
+                let _ = self.current_page.compare_exchange(
+                    current_page_id,
+                    next_page_id,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 continue;
             }
         }
@@ -147,66 +171,58 @@ impl PinnedBlobStore {
 
     /// Append large data spanning multiple pages
     fn append_multi_page(&self, data: &[u8]) -> Result<BlobHandle> {
-        let mut remaining = data;
-        let mut start_page_id = None;
-        let mut start_offset = None;
-        let mut current_page_id = self.current_page.load(Ordering::Acquire);
-        let first_generation = self.generation_counter.load(Ordering::Acquire);
+        // Multi-page strategy:
+        // We CANNOT easily span across random recycled fragments (Swiss Cheese).
+        // Solution: Always allocate a fresh CONTIGUOUS block at the High Water Mark.
 
-        while !remaining.is_empty() {
-            // Ensure current page exists
-            {
-                let backend = self.backend.read();
-                if backend.get_page(current_page_id).is_none() {
-                    drop(backend);
-                    self.allocate_page(current_page_id)?;
-                }
-            }
+        let chunk_size = self.config.page_size;
+        let num_pages = (data.len() + chunk_size - 1) / chunk_size;
 
-            // Try to append as much as possible to current page
-            let backend = self.backend.read();
-            if let Some(page) = backend.get_page(current_page_id) {
-                match page.try_append_partial(remaining) {
-                    Ok((offset, bytes_written)) => {
-                        // Record start position
-                        if start_page_id.is_none() {
-                            start_page_id = Some(current_page_id);
-                            start_offset = Some(offset);
-                        }
+        // Reserve N contiguous IDs from High Water Mark
+        let start_page_id = self
+            .high_water_mark
+            .fetch_add(num_pages as u32, Ordering::AcqRel)
+            + 1;
+        let end_page_id = start_page_id + (num_pages as u32) - 1;
 
-                        // Move to next chunk
-                        remaining = &remaining[bytes_written as usize..];
-
-                        // If page is full and we have more data, move to next page
-                        if !remaining.is_empty() && page.available_space() == 0 {
-                            drop(backend);
-                            current_page_id += 1;
-
-                            // Update current_page pointer
-                            self.current_page.store(current_page_id, Ordering::Release);
-                        } else {
-                            drop(backend);
-                        }
-                    }
-                    Err(BlobError::PageFull) => {
-                        drop(backend);
-                        current_page_id += 1;
-                        self.current_page.store(current_page_id, Ordering::Release);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+        // Allocate all pages in the range
+        // Note: This bypasses `free_pages`. Large blobs always consume new address space (until wrap-around).
+        for i in 0..num_pages {
+            self.allocate_page(start_page_id + i as u32)?;
         }
 
-        // Record multi-page append
+        // Write data
+        let mut remaining = data;
+        let mut start_offset = None;
+        let mut first_generation = 0;
+
+        for (i, page_id) in (start_page_id..=end_page_id).enumerate() {
+            let backend = self.backend.read();
+            let page = backend.get_page(page_id).ok_or(BlobError::PageFull)?; // Should exist
+
+            if i == 0 {
+                first_generation = page.generation;
+            }
+
+            let (offset, written) = page.try_append_partial(remaining)?;
+
+            if i == 0 {
+                start_offset = Some(offset);
+            }
+
+            remaining = &remaining[written as usize..];
+            // We just allocated these fresh, so they should accept data.
+            // If they are somehow full (impossible), we error out.
+        }
+
+        // Record metrics
         self.profiler.record_append(data.len());
         self.profiler.record_multi_page_span();
 
-        // Create multi-page handle
         Ok(BlobHandle::new_multi_page(
-            start_page_id.unwrap(),
-            start_offset.unwrap(),
-            current_page_id,
+            start_page_id,
+            start_offset.unwrap_or(0),
+            end_page_id,
             data.len() as u64,
             first_generation,
         ))
@@ -304,43 +320,74 @@ impl PinnedBlobStore {
         false
     }
 
-    /// >!REVIEW
     /// Clean up acknowledged and expired entries
     ///
     /// This method scans all pages and marks entries that have been acknowledged
-    /// or expired for cleanup. Pages that become empty are marked for potential
-    /// reclamation based on the decay timeout.
+    /// or expired for cleanup. Pages that are empty, successfully decayed,
+    /// AND strictly not equal to the current active page are removed from memory.
     ///
-    /// Returns the number of pages that were marked as empty.
+    /// Returns the number of pages that were freed.
     pub fn cleanup_acknowledged(&self) -> usize {
-        let backend = self.backend.read();
-        let page_count = backend.page_count();
-        let mut empty_pages = 0;
+        // We need a write lock to remove pages
+        let mut backend = self.backend.write();
 
-        // Scan all pages and mark empty ones
-        for page_id in 0..page_count as u32 {
-            if let Some(page) = backend.get_page(page_id) {
-                // Mark page as empty if all entries are acknowledged/expired
+        // Use the new active_page_ids method to iterate efficiently over sparse recycling IDs
+        let active_ids = backend.active_page_ids();
+
+        let mut freed_pages = 0;
+
+        // Safety: Snapshot current page to ensure we never delete the active write head
+        let current_active_page = self.current_page.load(Ordering::Acquire);
+
+        // Scan all active pages
+        for page_id in active_ids {
+            // SAFETY RULE: Never touch the current active page
+            if page_id == current_active_page {
+                continue;
+            }
+
+            // We must first get a reference to check status
+            let (should_remove, used_bytes) = if let Some(page) = backend.get_page(page_id) {
+                // 1. Mark entries as empty/acknowledged
                 page.mark_empty_if_needed(self.config.default_ttl_ms);
 
-                // Check if page should be cleaned up
-                if page.is_empty(self.config.default_ttl_ms) {
-                    empty_pages += 1;
+                // 2. Check if page is ready to decay (empty for > timeout)
+                let decay =
+                    page.should_decay(self.config.decay_timeout_ms, self.config.default_ttl_ms);
 
-                    // Record cleanup metrics
-                    let bytes_in_page = self.config.page_size - page.available_space();
-                    if bytes_in_page > 0 {
-                        self.profiler.record_page_cleanup(bytes_in_page);
-                    }
+                // Capture usage statistics before the page is dropped
+                let usage_ratio = page.usage();
+                let used_approx = (usage_ratio * self.config.page_size as f32) as usize;
+
+                (decay, used_approx)
+            } else {
+                (false, 0)
+            };
+
+            if should_remove {
+                // 3. Actually remove the page from memory
+                if backend.remove_page(page_id) {
+                    freed_pages += 1;
+
+                    // RECYCLING LOGIC:
+                    // Instead of just dropping the ID forever, we return it to the free_pages heap.
+                    // This allows lower IDs (0, 1, 2...) to be reused, keeping the active set compact.
+                    // We use Mutex lock scope tightly here.
+                    self.free_pages.lock().push(Reverse(page_id));
+
+                    // Record actual memory freed (approximate based on page size)
+                    // We use full page size because the entire allocation is dropped
+                    self.profiler
+                        .record_page_cleanup(self.config.page_size, used_bytes);
                 }
             }
         }
 
-        if empty_pages > 0 {
+        if freed_pages > 0 {
             self.profiler.record_cleanup();
         }
 
-        empty_pages
+        freed_pages
     }
 
     /// Get access to the profiler for metrics
@@ -373,7 +420,12 @@ impl std::fmt::Debug for PinnedBlobStore {
         f.debug_struct("PinnedBlobStore")
             .field("config", &self.config)
             .field("current_page", &self.current_page.load(Ordering::Acquire))
+            .field(
+                "high_water_mark",
+                &self.high_water_mark.load(Ordering::Acquire),
+            )
             .field("page_count", &self.backend.read().page_count())
+            .field("free_pages_count", &self.free_pages.lock().len())
             .finish()
     }
 }

@@ -32,10 +32,10 @@ fn main() {
     let stats = store.profiler().stats();
 
     println!("📊 Profiling Statistics:");
-    println!("  Total Pages:        {}", stats.total_pages);
+    println!("  Total Pages:        {}", stats.total_pages_allocated);
     println!(
         "  Total Data:         {:.2} GB",
-        stats.total_data_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        stats.total_bytes_written as f64 / 1024.0 / 1024.0 / 1024.0
     );
     println!("  Total Appends:      {}", stats.total_appends);
     println!("  Total Reads:        {}", stats.total_reads);

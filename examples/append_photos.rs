@@ -86,10 +86,10 @@ fn main() {
     let stats = store.profiler().stats();
 
     println!("\n📊 Profiling Metrics After Append:");
-    println!("  Total Pages Allocated:  {}", stats.total_pages);
+    println!("  Total Pages Allocated:  {}", stats.total_pages_allocated);
     println!(
         "  Total Data Stored:      {:.2} MB",
-        stats.total_data_bytes as f64 / 1024.0 / 1024.0
+        stats.total_bytes_written as f64 / 1024.0 / 1024.0
     );
     println!("  Total Appends:          {}", stats.total_appends);
     println!(
@@ -154,17 +154,17 @@ fn main() {
     println!("  Total Reads:            {}", final_stats.total_reads);
     println!(
         "  Total Read Bytes:       {:.2} MB",
-        final_stats.total_read_bytes as f64 / 1024.0 / 1024.0
+        final_stats.total_reads as f64 / 1024.0 / 1024.0
     );
     println!(
         "  Avg Read Size:          {:.2} KB",
         final_stats.avg_read_size() as f64 / 1024.0
     );
     println!("  Total Cleanups:         {}", final_stats.total_cleanups);
-    println!("  Pages Freed:            {}", final_stats.pages_freed);
+    println!("  Pages Freed:            {}", final_stats.total_pages_freed);
     println!(
         "  Bytes Freed:            {:.2} MB",
-        final_stats.bytes_freed as f64 / 1024.0 / 1024.0
+        final_stats.total_capacity_freed as f64 / 1024.0 / 1024.0
     );
 
     println!("\n{}", "─".repeat(60));

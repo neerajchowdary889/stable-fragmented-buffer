@@ -34,12 +34,12 @@
 //! ```
 
 pub mod backend;
-mod page;
-mod profiling;
-mod store;
-mod types;
+pub mod lifecycle;
+pub mod page;
+pub mod profiling;
+pub mod types;
 
-pub use store::{BlobStats, PinnedBlobStore};
+pub use page::{BlobStats, PinnedBlobStore};
 pub use types::{BlobError, BlobHandle, Config};
 
 #[cfg(test)]

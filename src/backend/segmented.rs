@@ -48,6 +48,10 @@ impl StorageBackend for SegmentedBackend {
     fn remove_page(&mut self, id: u32) -> bool {
         self.pages.remove(&id).is_some()
     }
+
+    fn active_page_ids(&self) -> Vec<u32> {
+        self.pages.keys().copied().collect()
+    }
 }
 
 impl std::fmt::Debug for SegmentedBackend {
