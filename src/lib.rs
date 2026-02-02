@@ -39,6 +39,7 @@ pub mod page;
 pub mod profiling;
 pub mod types;
 
+pub use lifecycle::LifecycleManager;
 pub use page::{BlobStats, PinnedBlobStore};
 pub use types::{BlobError, BlobHandle, Config};
 
