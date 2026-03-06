@@ -12,7 +12,7 @@ Unlike standard dynamic arrays (e.g., `std::vector` in C++ or Rust), which reall
 
 The system follows a **Layered Monolith** pattern, separating the public safety guarantees from the internal complex allocation strategies.
 
-### 2.1 Architectural Layers
+#### 2.1 Architectural Layers
 
 1. **The Public Facade:** A type-safe Rust API ensuring thread safety and pointer lifetimes.
 2. **The Elastic Brain:** A logic layer that manages "when" to allocate or deallocate, decoupled from the actual "write" operations.
@@ -85,13 +85,9 @@ To ensure consistent latency, the system employs an asymmetric growth/decay stra
 * *Goal:* Eliminate allocation latency during high-throughput writes.
 * *Algorithm:* During a write to `Page N`, if usage exceeds **80%** and `Page N+1` does not exist, the system triggers an immediate prefetch of `Page N+1`.
 * *Result:* The next page is allocated and cache-hot before the writer needs it.
-
-
 * **Slow Scale-Down (The Decay Rule):**
 * *Goal:* Prevent "thrashing" (allocating and freeing repeatedly at the boundary).
 * *Algorithm:* If a page is empty, it is not freed immediately. It is marked with a timestamp. It is only dropped if it remains empty for a configurable duration (e.g., 5 seconds).
-
-
 
 ### 3.3 Dual Storage Modes
 
@@ -117,9 +113,9 @@ The system can be configured at compile-time or initialization for two distinct 
 
 The store can be tuned using the following parameters:
 
-| Parameter | Recommended (Performance) | Recommended (Memory) | Description |
-| --- | --- | --- | --- |
-| `PAGE_SIZE` | 2 MB (Huge Pages) | 64 KB | The unit of allocation. |
-| `PREFETCH_THRESHOLD` | 0.8 (80%) | 0.95 (95%) | When to trigger the next allocation. |
-| `DECAY_TIMEOUT` | 5000 ms | 1000 ms | How long to keep empty pages alive. |
-| `BACKEND_MODE` | `Virtual` | `Segmented` | The underlying storage strategy. |
+| Parameter              | Recommended (Performance) | Recommended (Memory) | Description                          |
+| ---------------------- | ------------------------- | -------------------- | ------------------------------------ |
+| `PAGE_SIZE`          | 2 MB (Huge Pages)         | 64 KB                | The unit of allocation.              |
+| `PREFETCH_THRESHOLD` | 0.8 (80%)                 | 0.95 (95%)           | When to trigger the next allocation. |
+| `DECAY_TIMEOUT`      | 5000 ms                   | 1000 ms              | How long to keep empty pages alive.  |
+| `BACKEND_MODE`       | `Virtual`               | `Segmented`        | The underlying storage strategy.     |
