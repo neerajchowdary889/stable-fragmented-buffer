@@ -114,7 +114,10 @@ impl Page {
         }
     }
 
-    /// Try to append data to this page (lock-free if space available)
+    /// Try to append data to this page (lock-free via CAS loop).
+    ///
+    /// Uses compare_exchange instead of fetch_add + rollback to prevent a race
+    /// where concurrent overflow rollbacks corrupt the `used` counter.
     pub fn try_append(&self, data: &[u8]) -> Result<(u32, u32)> {
         let data_len = data.len();
 
@@ -126,31 +129,42 @@ impl Page {
             });
         }
 
-        // Atomically reserve space
-        let offset = self.used.fetch_add(data_len, Ordering::AcqRel);
+        // CAS loop: atomically claim [current_used, current_used + data_len)
+        loop {
+            let current_used = self.used.load(Ordering::Acquire);
 
-        // Check if we overflowed
-        if offset + data_len > self.data.len() {
-            // Rollback the reservation
-            self.used.fetch_sub(data_len, Ordering::AcqRel);
-            return Err(BlobError::PageFull);
+            if current_used + data_len > self.data.len() {
+                return Err(BlobError::PageFull);
+            }
+
+            match self.used.compare_exchange_weak(
+                current_used,
+                current_used + data_len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(offset) => {
+                    // We own [offset, offset + data_len). Copy data.
+                    unsafe {
+                        let ptr = self.data.as_ptr() as *mut u8;
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data_len);
+                    }
+
+                    // Add entry metadata
+                    let entry = EntryMetadata::new(offset as u32, data_len as u32);
+                    self.entries.write().push(entry);
+
+                    // Clear empty timestamp since we just added data
+                    self.empty_since.store(0, Ordering::Release);
+
+                    return Ok((offset as u32, data_len as u32));
+                }
+                Err(_) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            }
         }
-
-        // Copy data into the reserved space
-        // SAFETY: We've atomically reserved this space, no other thread can write here
-        unsafe {
-            let ptr = self.data.as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data_len);
-        }
-
-        // Add entry metadata
-        let entry = EntryMetadata::new(offset as u32, data_len as u32);
-        self.entries.write().push(entry);
-
-        // Clear empty timestamp since we just added data
-        self.empty_since.store(0, Ordering::Release);
-
-        Ok((offset as u32, data_len as u32))
     }
 
     /// Get a reference to data at the given offset
@@ -171,31 +185,44 @@ impl Page {
         self.data.len().saturating_sub(used)
     }
 
-    /// Try to append as much data as possible, return bytes written
+    /// Try to append as much data as possible (CAS-loop variant).
+    /// Returns (offset, bytes_written) on success.
     pub fn try_append_partial(&self, data: &[u8]) -> Result<(u32, u32)> {
-        let available = self.available_space();
-        if available == 0 {
-            return Err(BlobError::PageFull);
+        loop {
+            let current_used = self.used.load(Ordering::Acquire);
+            let available = self.data.len().saturating_sub(current_used);
+
+            if available == 0 {
+                return Err(BlobError::PageFull);
+            }
+
+            let to_write = data.len().min(available);
+
+            match self.used.compare_exchange_weak(
+                current_used,
+                current_used + to_write,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(offset) => {
+                    unsafe {
+                        let ptr = self.data.as_ptr() as *mut u8;
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), to_write);
+                    }
+
+                    let entry = EntryMetadata::new(offset as u32, to_write as u32);
+                    self.entries.write().push(entry);
+
+                    self.empty_since.store(0, Ordering::Release);
+
+                    return Ok((offset as u32, to_write as u32));
+                }
+                Err(_) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            }
         }
-
-        // Append as much as we can
-        let to_write = data.len().min(available);
-        let offset = self.used.fetch_add(to_write, Ordering::AcqRel);
-
-        // Copy data
-        unsafe {
-            let ptr = self.data.as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), to_write);
-        }
-
-        // Add entry metadata
-        let entry = EntryMetadata::new(offset as u32, to_write as u32);
-        self.entries.write().push(entry);
-
-        // Clear empty timestamp
-        self.empty_since.store(0, Ordering::Release);
-
-        Ok((offset as u32, to_write as u32))
     }
 
     /// Check if this page is full based on threshold (0.0 - 1.0)

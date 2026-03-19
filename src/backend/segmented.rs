@@ -1,20 +1,20 @@
 use crate::backend::StorageBackend;
 use crate::page::Page;
 use crate::types::Result;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-/// Segmented storage backend using heap-allocated pages
-/// Memory efficient, suitable for memory-constrained environments
+/// Segmented storage backend using heap-allocated pages.
+/// Uses BTreeMap for deterministic page ID ordering (important for cleanup and debugging).
 pub(crate) struct SegmentedBackend {
-    /// Map of page ID to page
-    pages: HashMap<u32, Page>,
+    /// Map of page ID to page (sorted by page ID)
+    pages: BTreeMap<u32, Page>,
 }
 
 impl SegmentedBackend {
     /// Create a new segmented backend
     pub fn new() -> Self {
         Self {
-            pages: HashMap::new(),
+            pages: BTreeMap::new(),
         }
     }
 }
