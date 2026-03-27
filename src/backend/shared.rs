@@ -200,6 +200,8 @@ pub struct SharedBackend {
     chunks: parking_lot::RwLock<BTreeMap<u32, SharedChunk>>,
     namespace: String,
     chunk_size: usize,
+    /// True if this process created the shared region (and is responsible for cleanup).
+    is_creator: bool,
 }
 
 impl SharedBackend {
@@ -218,6 +220,7 @@ impl SharedBackend {
             chunks: parking_lot::RwLock::new(BTreeMap::new()),
             namespace: namespace.to_string(),
             chunk_size,
+            is_creator: true,
         };
 
         // Allocate chunk 0
@@ -238,6 +241,7 @@ impl SharedBackend {
             chunks: parking_lot::RwLock::new(BTreeMap::new()),
             namespace: namespace.to_string(),
             chunk_size,
+            is_creator: false,
         };
 
         // Eagerly map all existing chunks
@@ -276,9 +280,13 @@ impl SharedBackend {
             let new_used = current_used as usize + data.len();
 
             if new_used > chunk.data_capacity() {
-                // Chunk full — allocate next and advance write_head
-                let next_id = page_id + 1;
-                self.allocate_chunk(next_id)?;
+                // Chunk full — try to reuse a recycled chunk before allocating new
+                let next_id = self.find_recycled_chunk(page_id)
+                    .unwrap_or_else(|| {
+                        let new_id = self.ctrl.chunk_count().load(Ordering::Acquire);
+                        let _ = self.allocate_chunk(new_id);
+                        new_id
+                    });
                 let _ = self.ctrl.write_head().compare_exchange(
                     page_id,
                     next_id,
@@ -486,6 +494,24 @@ impl SharedBackend {
         Ok(unsafe { &*chunk_ptr })
     }
 
+    /// Find an already-recycled chunk (used == 0, entry_count == 0) to reuse.
+    ///
+    /// Returns `Some(chunk_id)` if one is found, `None` if all mapped chunks are in use.
+    fn find_recycled_chunk(&self, skip_id: u32) -> Option<u32> {
+        let chunks = self.chunks.read();
+        for (&id, chunk) in chunks.iter() {
+            if id == skip_id {
+                continue;
+            }
+            let used = chunk.used().load(Ordering::Acquire);
+            let entries = chunk.entry_count().load(Ordering::Acquire);
+            if used == 0 && entries == 0 {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Allocate a new chunk (create the shm file).
     fn allocate_chunk(&self, id: u32) -> Result<()> {
         let gen = self.ctrl.generation().fetch_add(1, Ordering::AcqRel) + 1;
@@ -616,6 +642,33 @@ impl std::fmt::Debug for SharedBackend {
             .field("chunk_size", &self.chunk_size)
             .field("mapped_chunks", &self.chunks.read().len())
             .finish()
+    }
+}
+
+impl Drop for SharedBackend {
+    fn drop(&mut self) {
+        // Unmap all chunks (SharedChunk Drop handles munmap + close)
+        self.chunks.write().clear();
+
+        // Only the creator process unlinks the shm files
+        if !self.is_creator {
+            return;
+        }
+
+        #[cfg(unix)]
+        {
+            let chunk_count = self.ctrl.chunk_count().load(Ordering::Acquire);
+
+            // Unlink data chunks
+            for i in 0..chunk_count {
+                let name = CString::new(format!("/{}_data_{}", self.namespace, i)).unwrap();
+                unsafe { libc::shm_unlink(name.as_ptr()); }
+            }
+
+            // Unlink control file (done last so attachers can still read it)
+            let ctrl_name = CString::new(format!("/{}_ctrl", self.namespace)).unwrap();
+            unsafe { libc::shm_unlink(ctrl_name.as_ptr()); }
+        }
     }
 }
 

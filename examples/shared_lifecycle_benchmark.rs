@@ -2,9 +2,11 @@
 //!
 //! Tests the full lifecycle of the shared-memory backend:
 //!
-//! 1. **Dynamic chunk creation** — writes >32 MB to force multiple `/dev/shm` chunks
+//! 1. **Dynamic chunk creation** — writes >1 MB chunks to force multi-chunk
 //! 2. **Acknowledge + cleanup** — acknowledges all entries to trigger chunk recycling
-//! 3. **P50/P90/P99 latencies** — for both `append_shared()` and `resolve()`
+//! 3. **Chunk reuse** — verifies new writes reuse recycled chunk IDs (not infinite growth)
+//! 4. **Auto-cleanup** — Drop impl handles shm_unlink automatically
+//! 5. **P50/P90/P99 latencies** — for append, resolve, and acknowledge
 //!
 //! Run: `cargo run --example shared_lifecycle_benchmark --release`
 
@@ -36,18 +38,15 @@ fn main() {
     println!("  Messages:       {}", NUM_MESSAGES);
     println!();
 
-    // Clean up any leftover shm files from previous runs
-    cleanup_shm(NAMESPACE, 20);
-
-    // ── Phase 1: Create store + append (trigger multi-chunk) ─────────
-
-    println!("━━━ Phase 1: Append {} messages (trigger multi-chunk creation) ━━━", NUM_MESSAGES);
-
     let config = Config {
         default_ttl_ms: 60_000,     // 60s TTL
         decay_timeout_ms: 500,      // 500ms decay
         ..Config::default()
     };
+
+    // ── Phase 1: Create store + append (trigger multi-chunk) ─────────
+
+    println!("━━━ Phase 1: Append {} messages (trigger multi-chunk creation) ━━━", NUM_MESSAGES);
 
     let store = Arc::new(
         PinnedBlobStore::new_shared(config.clone(), NAMESPACE, CHUNK_SIZE)
@@ -67,8 +66,6 @@ fn main() {
     }
     let phase1_elapsed = phase1_start.elapsed();
 
-    // Check how many chunks were created
-    // (Access via the shared backend — the store wraps it)
     let chunks_used = handles.last().unwrap().page_id + 1;
 
     println!("  ✓ Appended {} messages in {:.2?}", NUM_MESSAGES, phase1_elapsed);
@@ -131,6 +128,9 @@ fn main() {
     let phase3_elapsed = phase3_start.elapsed();
 
     println!("  ✓ Process B resolved {}/{} handles in {:.2?}", cross_process_ok, NUM_MESSAGES, phase3_elapsed);
+
+    // Drop Process B's reference before cleanup
+    drop(store_b);
     println!();
 
     // ── Phase 4: Acknowledge all entries ─────────────────────────────
@@ -155,15 +155,12 @@ fn main() {
 
     println!("━━━ Phase 5: Cleanup (recycle fully-acknowledged chunks) ━━━");
 
-    // Wait for decay timeout to pass
     println!("  ⏳ Waiting 600ms for decay timeout...");
     std::thread::sleep(Duration::from_millis(600));
 
     let recycled = store.cleanup_shared();
     println!("  ✓ Recycled {} chunks", recycled);
 
-
-    // Try resolving after cleanup — handles should be invalid (generation mismatch)
     let mut stale_count = 0;
     for handle in &handles {
         if store.resolve(handle).is_none() {
@@ -171,14 +168,14 @@ fn main() {
         }
     }
     println!(
-        "  ✓ After cleanup: {}/{} handles correctly invalidated (generation mismatch)",
+        "  ✓ After cleanup: {}/{} handles correctly invalidated",
         stale_count, NUM_MESSAGES
     );
     println!();
 
-    // ── Phase 6: Re-use recycled arena (write new data) ──────────────
+    // ── Phase 6: Re-use recycled chunks (verify chunk IDs are reused) ─
 
-    println!("━━━ Phase 6: Write new data into recycled arena ━━━");
+    println!("━━━ Phase 6: Write new data into recycled chunks ━━━");
 
     let new_payload = vec![0xCDu8; PAYLOAD_SIZE];
     let mut new_handles = Vec::with_capacity(100);
@@ -187,6 +184,10 @@ fn main() {
         new_handles.push(handle);
     }
 
+    // Verify chunk IDs are being REUSED (not new IDs like 6, 7, 8...)
+    let max_new_chunk_id = new_handles.iter().map(|h| h.page_id).max().unwrap();
+    let reused_old_chunks = new_handles.iter().any(|h| h.page_id < chunks_used);
+
     let mut new_ok = 0;
     for handle in &new_handles {
         if let Some(data) = store.resolve(handle) {
@@ -194,7 +195,9 @@ fn main() {
             new_ok += 1;
         }
     }
-    println!("  ✓ Wrote and resolved {}/100 new messages after chunk recycling", new_ok);
+    println!("  ✓ Wrote and resolved {}/100 new messages after recycling", new_ok);
+    println!("  ✓ Max chunk ID used: {} (was {} before recycling)", max_new_chunk_id, chunks_used - 1);
+    println!("  ✓ Reused old chunk IDs: {}", if reused_old_chunks { "YES ✓" } else { "NO ✗" });
     println!();
 
     // ── Summary ──────────────────────────────────────────────────────
@@ -208,12 +211,13 @@ fn main() {
     println!("║  Cross-proc resolves:  {:>4}                                ║", cross_process_ok == NUM_MESSAGES);
     println!("║  Chunks recycled:      {:>4}                                ║", recycled);
     println!("║  Stale after cleanup:  {:>4}                                ║", stale_count);
+    println!("║  Chunk IDs reused:     {:>4}                                ║", reused_old_chunks);
     println!("║  Re-use after recycle: {:>4}                                ║", new_ok == 100);
     println!("╚══════════════════════════════════════════════════════════════╝");
 
-    // Cleanup shm files
-    cleanup_shm(NAMESPACE, chunks_used as u32 + 5);
-    println!("\n  🧹 Cleaned up /dev/shm files. Done!\n");
+    // Drop triggers automatic shm_unlink — no manual cleanup needed!
+    drop(store);
+    println!("\n  🧹 Auto-cleanup via Drop. Done!\n");
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -235,19 +239,4 @@ fn print_percentiles(label: &str, sorted_times: &[Duration]) {
         p99.as_nanos() as f64 / 1000.0,
         max.as_nanos() as f64 / 1000.0,
     );
-}
-
-fn cleanup_shm(namespace: &str, max_chunks: u32) {
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        unsafe {
-            let ctrl = CString::new(format!("/{}_ctrl", namespace)).unwrap();
-            libc::shm_unlink(ctrl.as_ptr());
-            for i in 0..max_chunks {
-                let data = CString::new(format!("/{}_data_{}", namespace, i)).unwrap();
-                libc::shm_unlink(data.as_ptr());
-            }
-        }
-    }
 }
