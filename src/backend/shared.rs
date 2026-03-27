@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -197,7 +198,7 @@ impl Drop for SharedChunk {
 /// Cross-process overflow arena backed by `/dev/shm` chunked files.
 pub struct SharedBackend {
     ctrl: ControlFile,
-    chunks: parking_lot::RwLock<BTreeMap<u32, SharedChunk>>,
+    chunks: parking_lot::RwLock<BTreeMap<u32, Arc<SharedChunk>>>,
     namespace: String,
     chunk_size: usize,
     /// True if this process created the shared region (and is responsible for cleanup).
@@ -263,7 +264,10 @@ impl SharedBackend {
     /// Returns an `OverflowHandle` that any process can `resolve()`.
     pub fn append(&self, data: &[u8]) -> Result<OverflowHandle> {
         if data.is_empty() {
-            return Err(BlobError::DataTooLarge { size: 0, max: self.data_capacity() });
+            return Err(BlobError::DataTooLarge {
+                size: 0,
+                max: self.data_capacity(),
+            });
         }
         if data.len() > self.data_capacity() {
             return Err(BlobError::DataTooLarge {
@@ -281,12 +285,11 @@ impl SharedBackend {
 
             if new_used > chunk.data_capacity() {
                 // Chunk full — try to reuse a recycled chunk before allocating new
-                let next_id = self.find_recycled_chunk(page_id)
-                    .unwrap_or_else(|| {
-                        let new_id = self.ctrl.chunk_count().load(Ordering::Acquire);
-                        let _ = self.allocate_chunk(new_id);
-                        new_id
-                    });
+                let next_id = self.find_recycled_chunk(page_id).unwrap_or_else(|| {
+                    let new_id = self.ctrl.chunk_count().load(Ordering::Acquire);
+                    let _ = self.allocate_chunk(new_id);
+                    new_id
+                });
                 let _ = self.ctrl.write_head().compare_exchange(
                     page_id,
                     next_id,
@@ -452,7 +455,11 @@ impl SharedBackend {
     pub fn debug_chunks(&self) {
         let write_head = self.ctrl.write_head().load(Ordering::Acquire);
         let chunks = self.chunks.read();
-        eprintln!("  [DEBUG] write_head={}, mapped_chunks={}", write_head, chunks.len());
+        eprintln!(
+            "  [DEBUG] write_head={}, mapped_chunks={}",
+            write_head,
+            chunks.len()
+        );
         for (&id, chunk) in chunks.iter() {
             let entries = chunk.entry_count().load(Ordering::Acquire);
             let acked = chunk.ack_count().load(Ordering::Acquire);
@@ -461,7 +468,12 @@ impl SharedBackend {
             let empty_ts = chunk.empty_since().load(Ordering::Acquire);
             eprintln!(
                 "    chunk[{}]: gen={} entries={} acked={} used={}/{} empty_since={} {}",
-                id, gen, entries, acked, used, self.data_capacity(),
+                id,
+                gen,
+                entries,
+                acked,
+                used,
+                self.data_capacity(),
                 empty_ts,
                 if id == write_head { "<-- ACTIVE" } else { "" }
             );
@@ -471,27 +483,27 @@ impl SharedBackend {
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Get a chunk reference, lazily mapping it if needed.
-    fn get_or_map_chunk(&self, id: u32) -> Result<&SharedChunk> {
+    ///
+    /// Returns an `Arc<SharedChunk>` so the caller can hold it safely
+    /// without keeping the RwLock guard alive.
+    fn get_or_map_chunk(&self, id: u32) -> Result<Arc<SharedChunk>> {
         // Fast path: already mapped
         {
             let chunks = self.chunks.read();
-            if chunks.contains_key(&id) {
-                // SAFETY: The chunk stays in the map for its entire lifetime.
-                // We hold a read-ref and return a reference whose lifetime is
-                // tied to `&self`, which outlives any individual read-guard.
-                let chunk = chunks.get(&id).unwrap();
-                let chunk_ptr = chunk as *const SharedChunk;
-                return Ok(unsafe { &*chunk_ptr });
+            if let Some(chunk) = chunks.get(&id) {
+                return Ok(Arc::clone(chunk));
             }
         }
 
         // Slow path: map it
-        let chunk = Self::open_chunk(&self.namespace, id, self.chunk_size, false)?;
+        let chunk = Arc::new(Self::open_chunk(
+            &self.namespace,
+            id,
+            self.chunk_size,
+            false,
+        )?);
         let mut chunks = self.chunks.write();
-        chunks.entry(id).or_insert(chunk);
-        let chunk = chunks.get(&id).unwrap();
-        let chunk_ptr = chunk as *const SharedChunk;
-        Ok(unsafe { &*chunk_ptr })
+        Ok(Arc::clone(chunks.entry(id).or_insert(chunk)))
     }
 
     /// Find an already-recycled chunk (used == 0, entry_count == 0) to reuse.
@@ -515,7 +527,12 @@ impl SharedBackend {
     /// Allocate a new chunk (create the shm file).
     fn allocate_chunk(&self, id: u32) -> Result<()> {
         let gen = self.ctrl.generation().fetch_add(1, Ordering::AcqRel) + 1;
-        let chunk = Self::open_chunk(&self.namespace, id, self.chunk_size, true)?;
+        let chunk = Arc::new(Self::open_chunk(
+            &self.namespace,
+            id,
+            self.chunk_size,
+            true,
+        )?);
         unsafe { chunk.init(gen) };
 
         {
@@ -586,17 +603,11 @@ impl SharedBackend {
         use std::os::unix::io::RawFd;
 
         let shm_name = format!("/{}", name);
-        let c_name =
-            CString::new(shm_name.as_str()).map_err(|_| BlobError::OutOfMemory)?;
+        let c_name = CString::new(shm_name.as_str()).map_err(|_| BlobError::OutOfMemory)?;
 
         let fd: RawFd = if create {
-            let fd = unsafe {
-                libc::shm_open(
-                    c_name.as_ptr(),
-                    libc::O_CREAT | libc::O_RDWR,
-                    0o600,
-                )
-            };
+            let fd =
+                unsafe { libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
             if fd < 0 {
                 return Err(BlobError::OutOfMemory);
             }
@@ -662,12 +673,16 @@ impl Drop for SharedBackend {
             // Unlink data chunks
             for i in 0..chunk_count {
                 let name = CString::new(format!("/{}_data_{}", self.namespace, i)).unwrap();
-                unsafe { libc::shm_unlink(name.as_ptr()); }
+                unsafe {
+                    libc::shm_unlink(name.as_ptr());
+                }
             }
 
             // Unlink control file (done last so attachers can still read it)
             let ctrl_name = CString::new(format!("/{}_ctrl", self.namespace)).unwrap();
-            unsafe { libc::shm_unlink(ctrl_name.as_ptr()); }
+            unsafe {
+                libc::shm_unlink(ctrl_name.as_ptr());
+            }
         }
     }
 }
@@ -679,28 +694,16 @@ mod tests {
     fn test_namespace() -> String {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
-        // Each test call gets a unique, short namespace ≤ 16 chars.
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         format!("st{}", id)
     }
 
-    fn cleanup_shm(namespace: &str, chunk_count: u32) {
-        #[cfg(unix)]
-        unsafe {
-            let ctrl_name = CString::new(format!("/{}_ctrl", namespace)).unwrap();
-            libc::shm_unlink(ctrl_name.as_ptr());
-            for i in 0..chunk_count {
-                let data_name = CString::new(format!("/{}_data_{}", namespace, i)).unwrap();
-                libc::shm_unlink(data_name.as_ptr());
-            }
-        }
-    }
+    // No more manual cleanup_shm — Drop handles it automatically.
 
     #[test]
     fn test_create_and_append() {
         let ns = test_namespace();
-        let chunk_size = 4096; // small for testing
-        let backend = SharedBackend::create(&ns, chunk_size).unwrap();
+        let backend = SharedBackend::create(&ns, 4096).unwrap();
 
         let data = b"Hello, shared world!";
         let handle = backend.append(data).unwrap();
@@ -710,27 +713,22 @@ mod tests {
 
         let resolved = backend.resolve(&handle, 30_000).unwrap();
         assert_eq!(resolved, data);
-
-        cleanup_shm(&ns, 1);
-    }
+    } // Drop auto-unlinks shm files
 
     #[test]
     fn test_attach_and_resolve() {
         let ns = test_namespace();
-        let chunk_size = 4096;
 
-        // Process A: create and write
-        let backend_a = SharedBackend::create(&ns, chunk_size).unwrap();
+        let backend_a = SharedBackend::create(&ns, 4096).unwrap();
         let data = b"cross-process payload";
         let handle = backend_a.append(data).unwrap();
 
-        // Process B: attach and read
         let backend_b = SharedBackend::attach(&ns).unwrap();
         let resolved = backend_b.resolve(&handle, 30_000).unwrap();
         assert_eq!(resolved, data);
 
-        cleanup_shm(&ns, 1);
-    }
+        drop(backend_b); // attacher drops first (no unlink)
+    } // creator drops, unlinks shm
 
     #[test]
     fn test_chunk_overflow_to_next() {
@@ -738,7 +736,6 @@ mod tests {
         let chunk_size = CHUNK_HEADER_SIZE + 128; // Only 128 bytes of data space
         let backend = SharedBackend::create(&ns, chunk_size).unwrap();
 
-        // Fill chunk 0
         let data = vec![0xABu8; 100];
         let h1 = backend.append(&data).unwrap();
         assert_eq!(h1.page_id, 0);
@@ -747,24 +744,167 @@ mod tests {
         let h2 = backend.append(&data).unwrap();
         assert_eq!(h2.page_id, 1);
 
-        // Both should resolve
-        let r1 = backend.resolve(&h1, 30_000).unwrap();
-        assert_eq!(r1, data.as_slice());
-        let r2 = backend.resolve(&h2, 30_000).unwrap();
-        assert_eq!(r2, data.as_slice());
-
-        cleanup_shm(&ns, 2);
+        assert_eq!(backend.resolve(&h1, 30_000).unwrap(), data.as_slice());
+        assert_eq!(backend.resolve(&h2, 30_000).unwrap(), data.as_slice());
     }
 
     #[test]
     fn test_acknowledge() {
         let ns = test_namespace();
-        let chunk_size = 4096;
-        let backend = SharedBackend::create(&ns, chunk_size).unwrap();
+        let backend = SharedBackend::create(&ns, 4096).unwrap();
 
         let handle = backend.append(b"ack test").unwrap();
         assert!(backend.acknowledge(&handle));
+    }
 
-        cleanup_shm(&ns, 1);
+    // ── Concurrent stress tests ──────────────────────────────────────
+
+    #[test]
+    fn test_concurrent_append() {
+        let ns = test_namespace();
+        let backend = Arc::new(SharedBackend::create(&ns, 8192).unwrap());
+
+        let num_threads = 4;
+        let writes_per_thread = 50;
+        let mut join_handles = Vec::new();
+
+        for t in 0..num_threads {
+            let b = Arc::clone(&backend);
+            join_handles.push(std::thread::spawn(move || {
+                let mut handles = Vec::new();
+                for i in 0..writes_per_thread {
+                    let payload = format!("t{}-msg{}", t, i);
+                    let h = b
+                        .append(payload.as_bytes())
+                        .expect("concurrent append failed");
+                    handles.push((h, payload));
+                }
+                handles
+            }));
+        }
+
+        let all_results: Vec<_> = join_handles
+            .into_iter()
+            .flat_map(|jh| jh.join().unwrap())
+            .collect();
+
+        assert_eq!(all_results.len(), num_threads * writes_per_thread);
+
+        // Verify all entries resolve correctly
+        for (handle, expected) in &all_results {
+            let data = backend
+                .resolve(handle, 30_000)
+                .expect("concurrent resolve failed");
+            assert_eq!(data, expected.as_bytes(), "data corruption detected");
+        }
+    }
+
+    #[test]
+    fn test_concurrent_append_and_resolve() {
+        let ns = test_namespace();
+        let backend = Arc::new(SharedBackend::create(&ns, 8192).unwrap());
+
+        // Phase 1: pre-populate some data
+        let mut seed_handles = Vec::new();
+        for i in 0..20 {
+            let payload = format!("seed-{}", i);
+            let h = backend.append(payload.as_bytes()).unwrap();
+            seed_handles.push((h, payload));
+        }
+
+        let seed_handles = Arc::new(seed_handles);
+        let mut join_handles = Vec::new();
+
+        // Spawn writers
+        for t in 0..2 {
+            let b = Arc::clone(&backend);
+            join_handles.push(std::thread::spawn(move || {
+                for i in 0..50 {
+                    let payload = format!("writer{}-{}", t, i);
+                    b.append(payload.as_bytes()).expect("writer append failed");
+                }
+            }));
+        }
+
+        // Spawn readers (resolving seed handles)
+        for _ in 0..2 {
+            let b = Arc::clone(&backend);
+            let seeds = Arc::clone(&seed_handles);
+            join_handles.push(std::thread::spawn(move || {
+                for (handle, expected) in seeds.iter() {
+                    let data = b
+                        .resolve(handle, 30_000)
+                        .expect("reader resolve failed during concurrent writes");
+                    assert_eq!(data, expected.as_bytes());
+                }
+            }));
+        }
+
+        for jh in join_handles {
+            jh.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_concurrent_lifecycle() {
+        let ns = test_namespace();
+        let backend = Arc::new(SharedBackend::create(&ns, 4096).unwrap());
+
+        let num_threads = 4;
+        let writes_per_thread = 30;
+
+        // Phase 1: concurrent writes
+        let mut join_handles = Vec::new();
+        for t in 0..num_threads {
+            let b = Arc::clone(&backend);
+            join_handles.push(std::thread::spawn(move || {
+                let mut handles = Vec::new();
+                for i in 0..writes_per_thread {
+                    let payload = format!("lc{}-{}", t, i);
+                    let h = b.append(payload.as_bytes()).unwrap();
+                    handles.push(h);
+                }
+                handles
+            }));
+        }
+
+        let all_handles: Vec<_> = join_handles
+            .into_iter()
+            .flat_map(|jh| jh.join().unwrap())
+            .collect();
+
+        // Phase 2: concurrent acknowledge
+        let all_handles = Arc::new(all_handles);
+        let mut ack_threads = Vec::new();
+        let chunk_size = all_handles.len() / num_threads;
+        for t in 0..num_threads {
+            let b = Arc::clone(&backend);
+            let handles = Arc::clone(&all_handles);
+            ack_threads.push(std::thread::spawn(move || {
+                let start = t * chunk_size;
+                let end = if t == num_threads - 1 {
+                    handles.len()
+                } else {
+                    start + chunk_size
+                };
+                for h in &handles[start..end] {
+                    b.acknowledge(h);
+                }
+            }));
+        }
+
+        for jh in ack_threads {
+            jh.join().unwrap();
+        }
+
+        // Phase 3: cleanup (with 0ms decay for immediate recycling)
+        let recycled = backend.cleanup_chunks(30_000, 0);
+
+        // Should have recycled some non-active chunks
+        assert!(
+            recycled > 0 || all_handles.iter().all(|h| h.page_id == 0),
+            "Expected chunks to be recycled (recycled={}, but not all on chunk 0)",
+            recycled
+        );
     }
 }
