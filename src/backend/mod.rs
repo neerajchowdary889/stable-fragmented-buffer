@@ -23,3 +23,4 @@ pub(crate) trait StorageBackend: Send + Sync {
 }
 
 pub mod segmented;
+pub mod shared;

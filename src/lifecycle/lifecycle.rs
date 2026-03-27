@@ -22,10 +22,12 @@ impl LifecycleManager {
 
     /// Run a single maintenance cycle
     ///
-    /// Returns the number of pages freed.
+    /// Returns the number of pages/chunks freed (heap + shared).
     pub fn maintenance_cycle(&self) -> usize {
         if let Some(store) = self.store.upgrade() {
-            store.cleanup_acknowledged()
+            let heap_freed = store.cleanup_acknowledged();
+            let shared_freed = store.cleanup_shared();
+            heap_freed + shared_freed
         } else {
             0
         }

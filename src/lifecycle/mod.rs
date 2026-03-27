@@ -13,9 +13,10 @@ pub trait BlobStoreLifecycleExt {
     /// Usage:
     /// ```rust
     /// use stable_fragmented_buffer::{PinnedBlobStore, BlobStoreLifecycleExt};
+    /// use std::sync::Arc;
     /// use std::time::Duration;
     ///
-    /// let store = PinnedBlobStore::with_defaults().unwrap();
+    /// let store = Arc::new(PinnedBlobStore::with_defaults().unwrap());
     /// store.start_cleanup(Duration::from_millis(100)); // Elastic Brain activated!
     /// ```
     fn start_cleanup(&self, interval: Duration);
