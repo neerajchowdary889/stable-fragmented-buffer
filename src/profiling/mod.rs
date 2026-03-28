@@ -108,16 +108,21 @@ impl Profiler {
         }
     }
 
-    /// Get current statistics snapshot
+    /// Get current statistics snapshot.
+    ///
+    /// Uses `Acquire` ordering on reads so that related counters (e.g.
+    /// allocated vs freed) are observed in a consistent order. Derived
+    /// values use `saturating_sub` to avoid underflow if a free is
+    /// observed before its corresponding allocation.
     pub fn stats(&self) -> ProfileStats {
-        let allocated_pages = self.state.total_pages_allocated.load(Ordering::Relaxed);
-        let freed_pages = self.state.total_pages_freed.load(Ordering::Relaxed);
+        let allocated_pages = self.state.total_pages_allocated.load(Ordering::Acquire);
+        let freed_pages = self.state.total_pages_freed.load(Ordering::Acquire);
 
-        let allocated_cap = self.state.total_capacity_allocated.load(Ordering::Relaxed);
-        let freed_cap = self.state.total_capacity_freed.load(Ordering::Relaxed);
+        let allocated_cap = self.state.total_capacity_allocated.load(Ordering::Acquire);
+        let freed_cap = self.state.total_capacity_freed.load(Ordering::Acquire);
 
-        let written = self.state.total_bytes_written.load(Ordering::Relaxed);
-        let discarded = self.state.total_bytes_discarded.load(Ordering::Relaxed);
+        let written = self.state.total_bytes_written.load(Ordering::Acquire);
+        let discarded = self.state.total_bytes_discarded.load(Ordering::Acquire);
 
         let active_pages = allocated_pages.saturating_sub(freed_pages);
         let active_cap = allocated_cap.saturating_sub(freed_cap);
@@ -133,13 +138,13 @@ impl Profiler {
         ProfileStats {
             total_pages_allocated: allocated_pages,
             total_pages_freed: freed_pages,
-            total_appends: self.state.total_appends.load(Ordering::Relaxed),
-            total_reads: self.state.total_reads.load(Ordering::Relaxed),
-            total_cleanups: self.state.total_cleanups.load(Ordering::Relaxed),
-            multi_page_spans: self.state.multi_page_spans.load(Ordering::Relaxed),
+            total_appends: self.state.total_appends.load(Ordering::Acquire),
+            total_reads: self.state.total_reads.load(Ordering::Acquire),
+            total_cleanups: self.state.total_cleanups.load(Ordering::Acquire),
+            multi_page_spans: self.state.multi_page_spans.load(Ordering::Acquire),
 
             total_bytes_written: written,
-            total_bytes_read: self.state.total_bytes_read.load(Ordering::Relaxed),
+            total_bytes_read: self.state.total_bytes_read.load(Ordering::Acquire),
             total_bytes_discarded: discarded,
 
             total_capacity_allocated: allocated_cap,

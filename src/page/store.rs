@@ -76,7 +76,22 @@ impl PinnedBlobStore {
     /// can map. Use `attach_shared` from other processes.
     #[cfg(unix)]
     pub fn new_shared(config: Config, namespace: &str, chunk_size: usize) -> Result<Self> {
-        let shared = SharedBackend::create(namespace, chunk_size)?;
+        Self::new_shared_with_limit(config, namespace, chunk_size, None)
+    }
+
+    /// Create a blob store backed by shared memory with a chunk limit.
+    ///
+    /// `max_chunks`: Maximum number of `/dev/shm` chunks allowed.
+    /// When the limit is reached and no recycled chunks are available,
+    /// `append_shared()` returns `Err(OutOfMemory)`.
+    #[cfg(unix)]
+    pub fn new_shared_with_limit(
+        config: Config,
+        namespace: &str,
+        chunk_size: usize,
+        max_chunks: Option<u32>,
+    ) -> Result<Self> {
+        let shared = SharedBackend::create(namespace, chunk_size, max_chunks)?;
         let backend: Box<dyn StorageBackend> = Box::new(SegmentedBackend::new());
         Ok(Self {
             backend: Arc::new(RwLock::new(backend)),
@@ -93,7 +108,7 @@ impl PinnedBlobStore {
     /// Attach to an existing shared-memory blob store (non-creator process).
     #[cfg(unix)]
     pub fn attach_shared(config: Config, namespace: &str) -> Result<Self> {
-        let shared = SharedBackend::attach(namespace)?;
+        let shared = SharedBackend::attach(namespace, None)?;
         let backend: Box<dyn StorageBackend> = Box::new(SegmentedBackend::new());
         Ok(Self {
             backend: Arc::new(RwLock::new(backend)),
@@ -136,6 +151,10 @@ impl PinnedBlobStore {
         // fetch_add returns OLD value. So if HWM is 0, we get 0.
         // But HWM tracks *Highest Allocated*.
         // If current is 0. Next should be 1.
+        let current_hwm = self.high_water_mark.load(Ordering::Acquire);
+        if current_hwm >= u32::MAX - 1 {
+            return Err(BlobError::OutOfMemory);
+        }
         let next_id = self.high_water_mark.fetch_add(1, Ordering::AcqRel) + 1;
         self.allocate_page(next_id)?;
         Ok(next_id)
@@ -224,6 +243,12 @@ impl PinnedBlobStore {
 
         let chunk_size = self.config.page_size;
         let num_pages = (data.len() + chunk_size - 1) / chunk_size;
+
+        // Check for wraparound before reserving contiguous IDs
+        let current_hwm = self.high_water_mark.load(Ordering::Acquire);
+        if current_hwm as u64 + num_pages as u64 >= u32::MAX as u64 {
+            return Err(BlobError::OutOfMemory);
+        }
 
         // Reserve N contiguous IDs from High Water Mark
         let start_page_id = self
@@ -467,23 +492,22 @@ impl PinnedBlobStore {
     /// embedding in a ring-buffer slot payload. Any process that has
     /// attached to the same namespace can `resolve()` this handle.
     ///
-    /// # Panics
-    /// Panics if the store is not in shared mode.
+    /// Returns `Err(InvalidHandle)` if the store is not in shared mode.
     pub fn append_shared(&self, data: &[u8]) -> Result<OverflowHandle> {
         self.shared
             .as_ref()
-            .expect("append_shared called on a heap-mode store")
+            .ok_or(BlobError::InvalidHandle)?
             .append(data)
     }
 
-    /// Resolve an `OverflowHandle` to a zero-copy byte slice.
+    /// Resolve an `OverflowHandle` to an owned copy of the data.
     ///
-    /// The returned `&[u8]` points directly into the mmapped `/dev/shm`
-    /// region — no allocation, no copy.
+    /// The data is copied out of the mmapped `/dev/shm` region so it
+    /// remains valid even if the underlying chunk is recycled.
     ///
     /// Returns `None` if the handle is expired, the generation doesn't match,
     /// or the store is not in shared mode.
-    pub fn resolve(&self, handle: &OverflowHandle) -> Option<&[u8]> {
+    pub fn resolve(&self, handle: &OverflowHandle) -> Option<Vec<u8>> {
         self.shared
             .as_ref()
             .and_then(|s| s.resolve(handle, self.config.default_ttl_ms))

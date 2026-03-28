@@ -1,6 +1,5 @@
-use crate::types::{BlobError, Result};
+use crate::types::{now_ms, BlobError, Result};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Metadata for a single entry within a page
 #[derive(Debug)]
@@ -20,10 +19,7 @@ pub(crate) struct EntryMetadata {
 
 impl EntryMetadata {
     fn new(offset: u32, size: u32) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
+        let timestamp = now_ms();
 
         Self {
             offset,
@@ -35,12 +31,7 @@ impl EntryMetadata {
 
     /// Check if this entry has expired
     pub fn is_expired(&self, ttl_ms: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
-
-        now - self.timestamp > ttl_ms
+        now_ms().saturating_sub(self.timestamp) > ttl_ms
     }
 
     /// Mark this entry as acknowledged
@@ -257,10 +248,7 @@ impl Page {
             // Only set timestamp if it hasn't been set yet
             let current = self.empty_since.load(Ordering::Acquire);
             if current == 0 {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("System time before UNIX epoch")
-                    .as_millis() as usize;
+                let now = now_ms() as usize;
 
                 let _ =
                     self.empty_since
@@ -283,12 +271,9 @@ impl Page {
             return false;
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as usize;
+        let now = now_ms() as usize;
 
-        (now - empty_since) as u64 > decay_timeout_ms
+        (now.saturating_sub(empty_since)) as u64 > decay_timeout_ms
     }
 
     /// Acknowledge an entry at the given offset

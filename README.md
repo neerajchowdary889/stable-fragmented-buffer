@@ -4,7 +4,7 @@
 
 **stable fragmented buffer** is a high-performance, in-memory blob storage system designed for Rust. It addresses a specific systems programming challenge: growing a memory buffer dynamically without invalidating existing pointers to that data.
 
-Unlike standard dynamic arrays (e.g., `std::vector` in C++ or Rust), which reallocate and move memory upon growth, Pinned Page Store ensures **Pointer Stability**. Once data is written, its physical address never changes. It combines this stability with an **Elastic Lifecycle Manager** that prefetches memory to prevent latency spikes and lazily releases memory to prevent thrashing.
+Unlike standard dynamic arrays (e.g., `std::vector` in C++ or Rust), which reallocate and move memory upon growth, Pinned Page Store ensures **Pointer Stability**. Once data is written, its physical address never changes. The primary production mode is **SharedBackend** — a cross-process arena backed by POSIX shared memory (`/dev/shm`) that lets multiple processes read and write the same data with zero-copy access and no OS-level IPC on the hot path.
 
 ---
 
@@ -16,15 +16,17 @@ The system follows a **Layered Monolith** pattern, separating the public safety 
 
 1. **The Public Facade:** A type-safe Rust API ensuring thread safety and pointer lifetimes.
 2. **The Elastic Brain:** A logic layer that manages "when" to allocate or deallocate, decoupled from the actual "write" operations.
-3. **The Storage Backend:** An abstract layer supporting two distinct memory strategies (Segmented Heap vs. Virtual Memory).
+3. **The Storage Backend:** An abstract layer. The primary backend is **SharedBackend** — a cross-process `/dev/shm` arena. A single-process **SegmentedBackend** is also available for local use.
 
 ### 2.2 System Diagram
 
 ```plaintext
 +-------------------------------------------------------------+
 |               PinnedBlobStore (Public API)                  |
-|  - append(data) -> &Data    (Safe, Stable Pointer)          |
-|  - get_ref(offset) -> &Data (O(1) Random Access)            |
+|  append_shared(data) -> OverflowHandle  (creator/attacher)  |
+|  resolve(&handle) -> &[u8]             (zero-copy mmap)     |
+|  acknowledge_shared(&handle)           (mark consumed)      |
+|  cleanup_shared()                      (recycle chunks)     |
 +------------------------------+------------------------------+
                                |
                                v
@@ -36,34 +38,31 @@ The system follows a **Layered Monolith** pattern, separating the public safety 
 |   | (Rapid Scale-Up)      |     | (Slow Scale-Down)     |   |
 |   +-----------------------+     +-----------------------+   |
 |   | Trigger:              |     | Trigger:              |   |
-|   |  Usage > 80% AND      |     |  Page Empty AND       |   |
-|   |  Next Page is Null    |     |  Age > 5 seconds      |   |
+|   |  Chunk full           |     |  Chunk fully acked AND|   |
+|   |  → allocate new chunk |     |  Age > decay_timeout  |   |
 |   +----------+------------+     +-----------+-----------+   |
 |              |                              |               |
-|              v (Prefetch)                   v (Drop)        |
+|              v (new /dev/shm chunk)         v (recycle)     |
 +--------------+------------------------------+---------------+
-               |                              |
-               +---------------+--------------+
                                |
                                v
 +-------------------------------------------------------------+
-|                Storage Backend (The Muscle)                 |
+|            SharedBackend (Primary — /dev/shm)               |
 |                                                             |
-|   [ PageDirectory (Vec<Page>) ]                             |
+|  /dev/shm/{ns}_ctrl          128-byte control file         |
+|    magic · version · chunk_size                             |
+|    write_head (AtomicU32) · chunk_count (AtomicU32)         |
+|    generation (AtomicU32)                                   |
 |                                                             |
-|           (Polymorphism / Strategy Trait)                   |
-|          +--------------------------+                       |
-|          |                          |                       |
-+----------v-----------+    +---------v-----------+           |
-|  Mode A: Segmented   |    |   Mode B: Virtual   |           |
-|  (Memory Efficient)  |    | (Performance Heavy) |           |
-+----------------------+    +---------------------+           |
-| - Linked 64KB Blocks |    | - Contiguous 1TB    |           |
-| - Heap (Box::new)    |    | - OS Commit (mmap)  |           |
-| - "Skip" overflow    |    | - No fragmentation  |           |
-+----------------------+    +---------------------+           |
+|  /dev/shm/{ns}_data_0        32 MB data chunk              |
+|  /dev/shm/{ns}_data_1        32 MB data chunk              |
+|  ...                                                        |
+|                                                             |
+|  Each chunk header (64 bytes):                              |
+|    used · generation · entry_count · ack_count · empty_since|
+|                                                             |
+|  Synchronisation: atomics embedded in mmap (no syscalls)   |
 +-------------------------------------------------------------+
-
 ```
 
 ---
@@ -72,50 +71,56 @@ The system follows a **Layered Monolith** pattern, separating the public safety 
 
 ### 3.1 Pointer Stability
 
-Standard vectors grow by allocating a larger block and moving all data to it, invalidating old pointers. Pinned Page Store grows by chaining new fixed-size blocks (pages).
+Standard vectors grow by allocating a larger block and moving all data to it, invalidating old pointers. Pinned Page Store grows by allocating new fixed-size chunks.
 
-* **Benefit:** A pointer `&MyStruct` obtained at startup remains valid until the store is dropped.
-* **Mechanism:** Data is never moved, only appended.
+* **Benefit:** An `OverflowHandle` obtained in one process resolves to valid data in any attached process until the chunk is recycled.
+* **Mechanism:** Data is never moved after it is written into a chunk.
 
 ### 3.2 Elastic Scaling (Hysteresis)
 
 To ensure consistent latency, the system employs an asymmetric growth/decay strategy.
 
-* **Rapid Scale-Up (The 80% Rule):**
-* *Goal:* Eliminate allocation latency during high-throughput writes.
-* *Algorithm:* During a write to `Page N`, if usage exceeds **80%** and `Page N+1` does not exist, the system triggers an immediate prefetch of `Page N+1`.
-* *Result:* The next page is allocated and cache-hot before the writer needs it.
-* **Slow Scale-Down (The Decay Rule):**
-* *Goal:* Prevent "thrashing" (allocating and freeing repeatedly at the boundary).
-* *Algorithm:* If a page is empty, it is not freed immediately. It is marked with a timestamp. It is only dropped if it remains empty for a configurable duration (e.g., 5 seconds).
+* **Rapid Scale-Up:** When the active chunk is full, the writer immediately allocates a new `/dev/shm` chunk (or reuses a recycled one) and advances `write_head`.
+* **Slow Scale-Down (The Decay Rule):** A chunk whose `ack_count >= entry_count` is not freed immediately. It is only recycled (header reset, new generation) after it has been fully acknowledged for at least `decay_timeout_ms` (default 5 s). This prevents thrashing at workload boundaries.
+* **Chunk Recycling:** Before allocating a fresh chunk, the writer scans for existing chunks with `used == 0 && entry_count == 0` and reuses them, keeping the file count compact.
 
-### 3.3 Dual Storage Modes
+### 3.3 SharedBackend — Cross-Process Design
 
-The system can be configured at compile-time or initialization for two distinct use cases.
+All synchronisation happens via atomics embedded directly in the mmap region — no mutexes, semaphores, or futexes on the hot write path.
 
-#### Mode A: Segmented (Memory Efficient)
+#### Control File Layout (`{ns}_ctrl`, 128 bytes)
 
-* **Implementation:** `Vec<Box<[u8]>>`
-* **Behavior:** Allocates distinct 4KB or 64KB chunks on the heap.
-* **Contiguity:** Logically contiguous, physically fragmented.
-* **Overflow:** Uses a "Skip-and-Pad" strategy. If an object does not fit in the remaining space of the current page, the remaining space is skipped (wasted), and the object is written to the start of a new page to ensure the object itself is contiguous.
+| Offset | Field         | Size | Description                          |
+|--------|---------------|------|--------------------------------------|
+| 0      | `magic`       | 8    | `0x444D58505F4F5646` ("DMXP_OVF")   |
+| 8      | `version`     | 4    | Protocol version (1)                 |
+| 12     | `chunk_size`  | 4    | Bytes per data chunk                 |
+| 16     | `write_head`  | 4    | Active chunk ID (`AtomicU32`)        |
+| 20     | `chunk_count` | 4    | Highest allocated chunk + 1          |
+| 24     | `generation`  | 4    | Global generation counter            |
+| 28     | _(reserved)_  | 100  | Pad to 128 bytes                     |
 
-#### Mode B: Virtual (Performance Heavy)
+#### Chunk Header Layout (first 64 bytes of each `{ns}_data_N`)
 
-* **Implementation:** `mmap` (Linux/macOS) or `VirtualAlloc` (Windows).
-* **Behavior:** Reserves a massive virtual address space (e.g., 1TB) but only commits physical RAM as needed.
-* **Contiguity:** Perfectly contiguous.
-* **Overflow:** None. Objects can span across physical page boundaries because the virtual addressing is linear.
+| Offset | Field          | Size | Description                              |
+|--------|----------------|------|------------------------------------------|
+| 0      | `used`         | 4    | Bytes written (`AtomicU32`, CAS target)  |
+| 4      | `generation`   | 4    | Recycling generation (`AtomicU32`)       |
+| 8      | `entry_count`  | 4    | Total entries appended (`AtomicU32`)     |
+| 12     | `ack_count`    | 4    | Acknowledged entries (`AtomicU32`)       |
+| 16     | `empty_since`  | 8    | Timestamp when fully acked (`AtomicU64`) |
+| 24     | _(reserved)_   | 40   | Pad to 64 bytes                          |
+
+Data starts at byte 64 of each chunk.
 
 ---
 
 ## 4. Configuration Specification
 
-The store can be tuned using the following parameters:
-
 | Parameter              | Recommended (Performance) | Recommended (Memory) | Description                          |
-| ---------------------- | ------------------------- | -------------------- | ------------------------------------ |
-| `PAGE_SIZE`          | 2 MB (Huge Pages)         | 64 KB                | The unit of allocation.              |
-| `PREFETCH_THRESHOLD` | 0.8 (80%)                 | 0.95 (95%)           | When to trigger the next allocation. |
-| `DECAY_TIMEOUT`      | 5000 ms                   | 1000 ms              | How long to keep empty pages alive.  |
-| `BACKEND_MODE`       | `Virtual`               | `Segmented`        | The underlying storage strategy.     |
+|------------------------|---------------------------|----------------------|--------------------------------------|
+| `page_size`            | 2 MB                      | 512 KB               | Heap page size (single-process mode) |
+| `prefetch_threshold`   | 0.8 (80%)                 | 0.95 (95%)           | When to trigger next allocation      |
+| `decay_timeout_ms`     | 5000 ms                   | 1000 ms              | How long to keep empty chunks alive  |
+| `default_ttl_ms`       | 30 000 ms                 | 10 000 ms            | Handle TTL before expiry             |
+| `chunk_size` (shared)  | 32 MB (default)           | 4–8 MB               | Size of each `/dev/shm` data chunk   |

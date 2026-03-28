@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use super::types::now_ms;
 
 /// Cross-process overflow handle.
 /// Stored directly in the ring buffer slot payload when `overflow == 1`.
@@ -26,10 +26,7 @@ pub struct OverflowHandle {
 impl OverflowHandle {
     /// Create a new overflow handle.
     pub fn new(page_id: u32, offset: u32, size: u32, generation: u32) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
+        let timestamp = now_ms();
 
         Self {
             page_id,
@@ -42,22 +39,12 @@ impl OverflowHandle {
 
     /// Check if this handle has expired based on the given TTL (in milliseconds).
     pub fn is_expired(&self, ttl_ms: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
-
-        now.saturating_sub(self.timestamp) > ttl_ms
+        now_ms().saturating_sub(self.timestamp) > ttl_ms
     }
 
     /// Get the age of this handle in milliseconds.
     pub fn age_ms(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
-
-        now.saturating_sub(self.timestamp)
+        now_ms().saturating_sub(self.timestamp)
     }
 
     /// Serialize this handle to a byte slice (zero-copy view).
