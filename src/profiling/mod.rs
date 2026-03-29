@@ -1,7 +1,23 @@
-//! Lightweight profiling module - tracks ONLY current state
+//! # Profiling — Lock-Free Metrics
 //!
-//! Zero historical data - just atomic counters for latest metrics.
-//! Fire-and-forget updates, no blocking.
+//! Lightweight, lock-free metric tracking via atomic counters.
+//! Zero historical data — just fire-and-forget increments on the write path
+//! and a consistent snapshot via [`Profiler::stats()`] on the read path.
+//!
+//! ## Tracked metrics
+//!
+//! - **Pages**: allocated, freed, active (derived)
+//! - **Operations**: appends, reads, cleanups, multi-page spans
+//! - **Data volume**: bytes written, read, discarded
+//! - **Capacity**: allocated, freed, fragmentation ratio
+//! - **Uptime**: seconds since profiler creation
+//!
+//! ## Ordering
+//!
+//! - Writes use `Relaxed` — fire-and-forget, no synchronisation needed.
+//! - Reads use `Acquire` — snapshot is consistent enough for derived
+//!   values (e.g. `active_pages = allocated - freed`) to never underflow.
+//!   `saturating_sub` is used as a safety net.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -89,6 +105,9 @@ struct ProfilerState {
 }
 
 impl Profiler {
+    /// Create a new profiler with all counters at zero.
+    ///
+    /// Time: O(1).
     pub fn new() -> Self {
         Self {
             state: Arc::new(ProfilerState {
@@ -114,6 +133,8 @@ impl Profiler {
     /// allocated vs freed) are observed in a consistent order. Derived
     /// values use `saturating_sub` to avoid underflow if a free is
     /// observed before its corresponding allocation.
+    ///
+    /// Time: O(1) — reads ~11 atomic counters and computes derived values.
     pub fn stats(&self) -> ProfileStats {
         let allocated_pages = self.state.total_pages_allocated.load(Ordering::Acquire);
         let freed_pages = self.state.total_pages_freed.load(Ordering::Acquire);
@@ -160,6 +181,7 @@ impl Profiler {
         }
     }
 
+    /// Record an append operation. Time: O(1).
     pub fn record_append(&self, size: usize) {
         self.state.total_appends.fetch_add(1, Ordering::Relaxed);
         self.state
@@ -167,6 +189,7 @@ impl Profiler {
             .fetch_add(size as u64, Ordering::Relaxed);
     }
 
+    /// Record a read operation. Time: O(1).
     pub fn record_read(&self, size: usize) {
         self.state.total_reads.fetch_add(1, Ordering::Relaxed);
         self.state
@@ -174,6 +197,7 @@ impl Profiler {
             .fetch_add(size as u64, Ordering::Relaxed);
     }
 
+    /// Record a page allocation. Time: O(1).
     pub fn record_page_allocated(&self, capacity: usize) {
         self.state
             .total_pages_allocated
@@ -183,6 +207,7 @@ impl Profiler {
             .fetch_add(capacity as u64, Ordering::Relaxed);
     }
 
+    /// Record a page cleanup (freed). Time: O(1).
     pub fn record_page_cleanup(&self, capacity: usize, used_data: usize) {
         self.state.total_pages_freed.fetch_add(1, Ordering::Relaxed);
         self.state
@@ -193,10 +218,12 @@ impl Profiler {
             .fetch_add(used_data as u64, Ordering::Relaxed);
     }
 
+    /// Record a cleanup cycle. Time: O(1).
     pub fn record_cleanup(&self) {
         self.state.total_cleanups.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a multi-page span. Time: O(1).
     pub fn record_multi_page_span(&self) {
         self.state.multi_page_spans.fetch_add(1, Ordering::Relaxed);
     }

@@ -109,6 +109,10 @@ impl Page {
     ///
     /// Uses compare_exchange instead of fetch_add + rollback to prevent a race
     /// where concurrent overflow rollbacks corrupt the `used` counter.
+    ///
+    /// Time: O(d) where d = data.len() (memcpy). The CAS loop is O(1) amortised
+    /// under low contention; under high contention it spins proportional to
+    /// the number of concurrent writers.
     pub fn try_append(&self, data: &[u8]) -> Result<(u32, u32)> {
         let data_len = data.len();
 
@@ -158,7 +162,9 @@ impl Page {
         }
     }
 
-    /// Get a reference to data at the given offset
+    /// Get a reference to data at the given offset.
+    ///
+    /// Time: O(1) — bounds check + slice creation.
     pub fn get(&self, offset: u32, size: u32) -> Option<&[u8]> {
         let start = offset as usize;
         let end = start + size as usize;
@@ -178,6 +184,8 @@ impl Page {
 
     /// Try to append as much data as possible (CAS-loop variant).
     /// Returns (offset, bytes_written) on success.
+    ///
+    /// Time: O(min(d, available)) where d = data.len(). Same CAS amortisation as `try_append`.
     pub fn try_append_partial(&self, data: &[u8]) -> Result<(u32, u32)> {
         loop {
             let current_used = self.used.load(Ordering::Acquire);
@@ -231,7 +239,9 @@ impl Page {
         used as f32 / capacity as f32
     }
 
-    /// Check if all entries are acknowledged or expired
+    /// Check if all entries are acknowledged or expired.
+    ///
+    /// Time: O(e) where e = number of entries in the page.
     pub fn is_empty(&self, ttl_ms: u64) -> bool {
         let entries = self.entries.read();
 
@@ -276,7 +286,9 @@ impl Page {
         (now.saturating_sub(empty_since)) as u64 > decay_timeout_ms
     }
 
-    /// Acknowledge an entry at the given offset
+    /// Acknowledge an entry at the given offset.
+    ///
+    /// Time: O(e) — linear scan of entries to find the matching offset.
     pub fn acknowledge_entry(&self, offset: u32) -> bool {
         let entries = self.entries.read();
 

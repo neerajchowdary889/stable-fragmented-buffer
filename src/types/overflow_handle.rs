@@ -25,6 +25,8 @@ pub struct OverflowHandle {
 
 impl OverflowHandle {
     /// Create a new overflow handle.
+    ///
+    /// Time: O(1).
     pub fn new(page_id: u32, offset: u32, size: u32, generation: u32) -> Self {
         let timestamp = now_ms();
 
@@ -38,6 +40,8 @@ impl OverflowHandle {
     }
 
     /// Check if this handle has expired based on the given TTL (in milliseconds).
+    ///
+    /// Time: O(1).
     pub fn is_expired(&self, ttl_ms: u64) -> bool {
         now_ms().saturating_sub(self.timestamp) > ttl_ms
     }
@@ -51,6 +55,8 @@ impl OverflowHandle {
     ///
     /// # Safety
     /// Safe because `OverflowHandle` is `#[repr(C)]` with no padding ambiguity.
+    ///
+    /// Time: O(1) — pointer cast, no copy.
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
@@ -63,6 +69,8 @@ impl OverflowHandle {
     /// Deserialize an `OverflowHandle` from a byte slice.
     ///
     /// Returns `None` if the slice is not exactly `size_of::<OverflowHandle>()` bytes.
+    ///
+    /// Time: O(1) — 24-byte memcpy.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != std::mem::size_of::<Self>() {
             return None;

@@ -3,6 +3,8 @@ use thiserror::Error;
 
 /// Get the current time in milliseconds since the UNIX epoch.
 /// Returns 0 if the system clock is before the epoch (avoids panics).
+///
+/// Time: O(1) — single syscall.
 #[inline]
 pub fn now_ms() -> u64 {
     SystemTime::now()
