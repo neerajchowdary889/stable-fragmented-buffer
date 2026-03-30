@@ -1,6 +1,5 @@
-use crate::types::{BlobError, Result};
+use crate::types::{now_ms, BlobError, Result};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Metadata for a single entry within a page
 #[derive(Debug)]
@@ -8,8 +7,8 @@ pub(crate) struct EntryMetadata {
     /// Offset within the page
     pub offset: u32,
 
-    /// Size of the entry
-    pub size: u32,
+    /// Size of the entry (retained for Debug output)
+    pub _size: u32,
 
     /// Creation timestamp
     pub timestamp: u64,
@@ -20,14 +19,11 @@ pub(crate) struct EntryMetadata {
 
 impl EntryMetadata {
     fn new(offset: u32, size: u32) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
+        let timestamp = now_ms();
 
         Self {
             offset,
-            size,
+            _size: size,
             timestamp,
             acknowledged: AtomicBool::new(false),
         }
@@ -35,12 +31,7 @@ impl EntryMetadata {
 
     /// Check if this entry has expired
     pub fn is_expired(&self, ttl_ms: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
-
-        now - self.timestamp > ttl_ms
+        now_ms().saturating_sub(self.timestamp) > ttl_ms
     }
 
     /// Mark this entry as acknowledged
@@ -118,6 +109,10 @@ impl Page {
     ///
     /// Uses compare_exchange instead of fetch_add + rollback to prevent a race
     /// where concurrent overflow rollbacks corrupt the `used` counter.
+    ///
+    /// Time: O(d) where d = data.len() (memcpy). The CAS loop is O(1) amortised
+    /// under low contention; under high contention it spins proportional to
+    /// the number of concurrent writers.
     pub fn try_append(&self, data: &[u8]) -> Result<(u32, u32)> {
         let data_len = data.len();
 
@@ -167,7 +162,9 @@ impl Page {
         }
     }
 
-    /// Get a reference to data at the given offset
+    /// Get a reference to data at the given offset.
+    ///
+    /// Time: O(1) — bounds check + slice creation.
     pub fn get(&self, offset: u32, size: u32) -> Option<&[u8]> {
         let start = offset as usize;
         let end = start + size as usize;
@@ -187,6 +184,8 @@ impl Page {
 
     /// Try to append as much data as possible (CAS-loop variant).
     /// Returns (offset, bytes_written) on success.
+    ///
+    /// Time: O(min(d, available)) where d = data.len(). Same CAS amortisation as `try_append`.
     pub fn try_append_partial(&self, data: &[u8]) -> Result<(u32, u32)> {
         loop {
             let current_used = self.used.load(Ordering::Acquire);
@@ -225,14 +224,6 @@ impl Page {
         }
     }
 
-    /// Check if this page is full based on threshold (0.0 - 1.0)
-    pub fn is_full(&self, threshold: f32) -> bool {
-        let used = self.used.load(Ordering::Acquire);
-        let capacity = self.data.len();
-
-        (used as f32 / capacity as f32) >= threshold
-    }
-
     /// Get current usage as a fraction (0.0 - 1.0)
     pub fn usage(&self) -> f32 {
         let used = self.used.load(Ordering::Acquire);
@@ -240,7 +231,9 @@ impl Page {
         used as f32 / capacity as f32
     }
 
-    /// Check if all entries are acknowledged or expired
+    /// Check if all entries are acknowledged or expired.
+    ///
+    /// Time: O(e) where e = number of entries in the page.
     pub fn is_empty(&self, ttl_ms: u64) -> bool {
         let entries = self.entries.read();
 
@@ -257,10 +250,7 @@ impl Page {
             // Only set timestamp if it hasn't been set yet
             let current = self.empty_since.load(Ordering::Acquire);
             if current == 0 {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("System time before UNIX epoch")
-                    .as_millis() as usize;
+                let now = now_ms() as usize;
 
                 let _ =
                     self.empty_since
@@ -283,15 +273,14 @@ impl Page {
             return false;
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as usize;
+        let now = now_ms() as usize;
 
-        (now - empty_since) as u64 > decay_timeout_ms
+        (now.saturating_sub(empty_since)) as u64 > decay_timeout_ms
     }
 
-    /// Acknowledge an entry at the given offset
+    /// Acknowledge an entry at the given offset.
+    ///
+    /// Time: O(e) — linear scan of entries to find the matching offset.
     pub fn acknowledge_entry(&self, offset: u32) -> bool {
         let entries = self.entries.read();
 
@@ -301,12 +290,6 @@ impl Page {
         } else {
             false
         }
-    }
-
-    /// Get the number of active (non-acknowledged, non-expired) entries
-    pub fn active_entry_count(&self, ttl_ms: u64) -> usize {
-        let entries = self.entries.read();
-        entries.iter().filter(|e| !e.should_cleanup(ttl_ms)).count()
     }
 }
 

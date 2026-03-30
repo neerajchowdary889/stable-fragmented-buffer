@@ -5,13 +5,19 @@ use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::backend::{segmented::SegmentedBackend, StorageBackend};
+use crate::backend::segmented::SegmentedBackend;
+use crate::backend::shared::SharedBackend;
+use crate::backend::StorageBackend;
 use crate::profiling::Profiler;
-use crate::types::{BlobError, BlobHandle, Config, Result};
+use crate::types::{BlobError, BlobHandle, Config, OverflowHandle, Result};
 
-/// The main blob store providing pointer-stable storage
+/// The main blob store providing pointer-stable storage.
+///
+/// Supports two backend modes:
+/// - **Heap** (default): Process-private pages via `SegmentedBackend`.
+/// - **Shared**: Cross-process pages via `/dev/shm` chunked files.
 pub struct PinnedBlobStore {
-    /// Storage backend (behind RwLock for thread safety)
+    /// Heap-mode storage backend (behind RwLock for thread safety)
     backend: Arc<RwLock<Box<dyn StorageBackend>>>,
 
     /// Configuration
@@ -31,6 +37,9 @@ pub struct PinnedBlobStore {
 
     /// Profiler for tracking metrics
     profiler: Profiler,
+
+    /// Optional shared-memory backend (present when mode = Shared)
+    shared: Option<SharedBackend>,
 }
 
 impl PinnedBlobStore {
@@ -47,6 +56,7 @@ impl PinnedBlobStore {
             free_pages: Mutex::new(BinaryHeap::new()),
             generation_counter: AtomicU32::new(0),
             profiler: Profiler::new(),
+            shared: None,
         };
 
         // Allocate the first page
@@ -58,6 +68,58 @@ impl PinnedBlobStore {
     /// Create a new blob store with default configuration
     pub fn with_defaults() -> Result<Self> {
         Self::new(Config::default())
+    }
+
+    /// Create a blob store backed by shared memory (creator process).
+    ///
+    /// Data is stored in `/dev/shm/{namespace}_data_*` files that any process
+    /// can map. Use `attach_shared` from other processes.
+    #[cfg(unix)]
+    pub fn new_shared(config: Config, namespace: &str, chunk_size: usize) -> Result<Self> {
+        Self::new_shared_with_limit(config, namespace, chunk_size, None)
+    }
+
+    /// Create a blob store backed by shared memory with a chunk limit.
+    ///
+    /// `max_chunks`: Maximum number of `/dev/shm` chunks allowed.
+    /// When the limit is reached and no recycled chunks are available,
+    /// `append_shared()` returns `Err(OutOfMemory)`.
+    #[cfg(unix)]
+    pub fn new_shared_with_limit(
+        config: Config,
+        namespace: &str,
+        chunk_size: usize,
+        max_chunks: Option<u32>,
+    ) -> Result<Self> {
+        let shared = SharedBackend::create(namespace, chunk_size, max_chunks)?;
+        let backend: Box<dyn StorageBackend> = Box::new(SegmentedBackend::new());
+        Ok(Self {
+            backend: Arc::new(RwLock::new(backend)),
+            config,
+            current_page: AtomicU32::new(0),
+            high_water_mark: AtomicU32::new(0),
+            free_pages: Mutex::new(BinaryHeap::new()),
+            generation_counter: AtomicU32::new(0),
+            profiler: Profiler::new(),
+            shared: Some(shared),
+        })
+    }
+
+    /// Attach to an existing shared-memory blob store (non-creator process).
+    #[cfg(unix)]
+    pub fn attach_shared(config: Config, namespace: &str) -> Result<Self> {
+        let shared = SharedBackend::attach(namespace, None)?;
+        let backend: Box<dyn StorageBackend> = Box::new(SegmentedBackend::new());
+        Ok(Self {
+            backend: Arc::new(RwLock::new(backend)),
+            config,
+            current_page: AtomicU32::new(0),
+            high_water_mark: AtomicU32::new(0),
+            free_pages: Mutex::new(BinaryHeap::new()),
+            generation_counter: AtomicU32::new(0),
+            profiler: Profiler::new(),
+            shared: Some(shared),
+        })
     }
 
     /// Allocate a specific page ID (internal low-level alloc)
@@ -89,6 +151,10 @@ impl PinnedBlobStore {
         // fetch_add returns OLD value. So if HWM is 0, we get 0.
         // But HWM tracks *Highest Allocated*.
         // If current is 0. Next should be 1.
+        let current_hwm = self.high_water_mark.load(Ordering::Acquire);
+        if current_hwm >= u32::MAX - 1 {
+            return Err(BlobError::OutOfMemory);
+        }
         let next_id = self.high_water_mark.fetch_add(1, Ordering::AcqRel) + 1;
         self.allocate_page(next_id)?;
         Ok(next_id)
@@ -176,7 +242,13 @@ impl PinnedBlobStore {
         // Solution: Always allocate a fresh CONTIGUOUS block at the High Water Mark.
 
         let chunk_size = self.config.page_size;
-        let num_pages = (data.len() + chunk_size - 1) / chunk_size;
+        let num_pages = data.len().div_ceil(chunk_size);
+
+        // Check for wraparound before reserving contiguous IDs
+        let current_hwm = self.high_water_mark.load(Ordering::Acquire);
+        if current_hwm as u64 + num_pages as u64 >= u32::MAX as u64 {
+            return Err(BlobError::OutOfMemory);
+        }
 
         // Reserve N contiguous IDs from High Water Mark
         let start_page_id = self
@@ -404,6 +476,65 @@ impl PinnedBlobStore {
         BlobStats {
             page_count,
             current_page_id: current_page,
+        }
+    }
+
+    // ── Shared-mode API ───────────────────────────────────────────────
+
+    /// Returns `true` if this store is in shared (cross-process) mode.
+    pub fn is_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// Append data to the **shared** overflow arena.
+    ///
+    /// Returns an `OverflowHandle` (24 bytes, `#[repr(C)]`) suitable for
+    /// embedding in a ring-buffer slot payload. Any process that has
+    /// attached to the same namespace can `resolve()` this handle.
+    ///
+    /// Returns `Err(InvalidHandle)` if the store is not in shared mode.
+    pub fn append_shared(&self, data: &[u8]) -> Result<OverflowHandle> {
+        self.shared
+            .as_ref()
+            .ok_or(BlobError::InvalidHandle)?
+            .append(data)
+    }
+
+    /// Resolve an `OverflowHandle` to an owned copy of the data.
+    ///
+    /// The data is copied out of the mmapped `/dev/shm` region so it
+    /// remains valid even if the underlying chunk is recycled.
+    ///
+    /// Returns `None` if the handle is expired, the generation doesn't match,
+    /// or the store is not in shared mode.
+    pub fn resolve(&self, handle: &OverflowHandle) -> Option<Vec<u8>> {
+        self.shared
+            .as_ref()
+            .and_then(|s| s.resolve(handle, self.config.default_ttl_ms))
+    }
+
+    /// Acknowledge a shared-mode entry.
+    pub fn acknowledge_shared(&self, handle: &OverflowHandle) -> bool {
+        self.shared
+            .as_ref()
+            .map(|s| s.acknowledge(handle))
+            .unwrap_or(false)
+    }
+
+    /// Run cleanup on shared chunks, recycling fully-acknowledged ones.
+    pub fn cleanup_shared(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map(|s| s.cleanup_chunks(self.config.default_ttl_ms, self.config.decay_timeout_ms))
+            .unwrap_or(0)
+    }
+
+    /// Print debug info about all mapped shared chunks.
+    pub fn debug_chunks(&self) {
+        if let Some(s) = self.shared.as_ref() {
+            s.debug_chunks();
+        } else {
+            eprintln!("  [DEBUG] No shared backend configured");
         }
     }
 }

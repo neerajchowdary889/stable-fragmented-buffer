@@ -39,9 +39,10 @@ pub mod page;
 pub mod profiling;
 pub mod types;
 
-pub use lifecycle::LifecycleManager;
+pub use backend::shared::SharedBackend;
+pub use lifecycle::{BlobStoreLifecycleExt, LifecycleManager};
 pub use page::{BlobStats, PinnedBlobStore};
-pub use types::{BlobError, BlobHandle, Config};
+pub use types::{BackendMode, BlobError, BlobHandle, Config, OverflowHandle};
 
 #[cfg(test)]
 mod tests {

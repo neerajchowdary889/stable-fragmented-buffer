@@ -1,6 +1,18 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Get the current time in milliseconds since the UNIX epoch.
+/// Returns 0 if the system clock is before the epoch (avoids panics).
+///
+/// Time: O(1) — single syscall.
+#[inline]
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Reference to data stored in the blob store.
 /// Supports both single-page and multi-page data.
 /// Total size: 32 bytes (still well under 1KB message queue limit)
@@ -31,10 +43,7 @@ pub struct BlobHandle {
 impl BlobHandle {
     /// Create a new blob handle for single-page data
     pub(crate) fn new(page_id: u32, offset: u32, size: u32, generation: u32) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
+        let timestamp = now_ms();
 
         Self {
             page_id,
@@ -55,10 +64,7 @@ impl BlobHandle {
         total_size: u64,
         generation: u32,
     ) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
+        let timestamp = now_ms();
 
         Self {
             page_id: start_page_id,
@@ -78,22 +84,12 @@ impl BlobHandle {
 
     /// Check if this handle has expired based on TTL
     pub(crate) fn is_expired(&self, ttl_ms: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
-
-        now - self.timestamp > ttl_ms
+        now_ms().saturating_sub(self.timestamp) > ttl_ms
     }
 
     /// Get the age of this handle in milliseconds
     pub fn age_ms(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time before UNIX epoch")
-            .as_millis() as u64;
-
-        now - self.timestamp
+        now_ms().saturating_sub(self.timestamp)
     }
 
     // Public getter methods for external access
@@ -152,10 +148,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            page_size: 1 * 1024 * 1024, // 1MB
-            prefetch_threshold: 0.8,    // 80%
-            decay_timeout_ms: 5000,     // 5 seconds
-            default_ttl_ms: 30000,      // 30 seconds
+            page_size: 1024 * 1024,  // 1MB
+            prefetch_threshold: 0.8, // 80%
+            decay_timeout_ms: 5000,  // 5 seconds
+            default_ttl_ms: 30000,   // 30 seconds
         }
     }
 }
