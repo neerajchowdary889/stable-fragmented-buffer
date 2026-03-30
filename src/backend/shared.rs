@@ -195,21 +195,6 @@ impl SharedChunk {
         ptr::write_bytes(self.ptr.as_ptr(), 0, CHUNK_HEADER_SIZE);
         self.generation().store(generation, Ordering::Release);
     }
-
-    /// Reset the chunk header atomically for recycling.
-    ///
-    /// Unlike `init()`, this uses individual atomic stores so it is safe
-    /// to call while other threads may be reading the header fields via
-    /// their own atomic loads.
-    fn reset_atomic(&self, new_generation: u32) {
-        self.used().store(0, Ordering::Release);
-        self.entry_count().store(0, Ordering::Release);
-        self.ack_count().store(0, Ordering::Release);
-        self.empty_since().store(0, Ordering::Release);
-        self.first_write_ts().store(0, Ordering::Release);
-        // Generation must be last — readers check generation to detect recycling.
-        self.generation().store(new_generation, Ordering::Release);
-    }
 }
 
 impl Drop for SharedChunk {

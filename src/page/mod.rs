@@ -21,8 +21,7 @@
 //! - Free-page recycling: `Mutex<BinaryHeap<Reverse<u32>>>` (min-heap)
 //! - Generation counter: `AtomicU32` (prevents ABA on recycled page IDs)
 
-mod page;
+pub(crate) mod page;
 mod store;
 
-pub use page::*;
 pub use store::*;

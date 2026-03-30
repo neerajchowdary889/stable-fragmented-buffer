@@ -12,8 +12,8 @@
 //! - [`BackendMode`] — Enum selecting heap vs shared storage.
 //! - [`now_ms()`] — Safe monotonic-ish timestamp helper used throughout.
 
-mod types;
 mod overflow_handle;
+mod types;
 
-pub use types::*;
 pub use overflow_handle::*;
+pub use types::*;

@@ -89,9 +89,10 @@ impl OverflowHandle {
 }
 
 /// Selects which storage backend `PinnedBlobStore` uses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum BackendMode {
     /// Process-private heap pages (original behaviour).
+    #[default]
     Heap,
     /// Cross-process shared memory via `/dev/shm` chunked files.
     Shared {
@@ -100,12 +101,6 @@ pub enum BackendMode {
         /// Size of each data chunk in bytes (default: 32 MB).
         chunk_size: usize,
     },
-}
-
-impl Default for BackendMode {
-    fn default() -> Self {
-        BackendMode::Heap
-    }
 }
 
 #[cfg(test)]

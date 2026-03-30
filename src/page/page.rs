@@ -7,8 +7,8 @@ pub(crate) struct EntryMetadata {
     /// Offset within the page
     pub offset: u32,
 
-    /// Size of the entry
-    pub size: u32,
+    /// Size of the entry (retained for Debug output)
+    pub _size: u32,
 
     /// Creation timestamp
     pub timestamp: u64,
@@ -23,7 +23,7 @@ impl EntryMetadata {
 
         Self {
             offset,
-            size,
+            _size: size,
             timestamp,
             acknowledged: AtomicBool::new(false),
         }
@@ -224,14 +224,6 @@ impl Page {
         }
     }
 
-    /// Check if this page is full based on threshold (0.0 - 1.0)
-    pub fn is_full(&self, threshold: f32) -> bool {
-        let used = self.used.load(Ordering::Acquire);
-        let capacity = self.data.len();
-
-        (used as f32 / capacity as f32) >= threshold
-    }
-
     /// Get current usage as a fraction (0.0 - 1.0)
     pub fn usage(&self) -> f32 {
         let used = self.used.load(Ordering::Acquire);
@@ -298,12 +290,6 @@ impl Page {
         } else {
             false
         }
-    }
-
-    /// Get the number of active (non-acknowledged, non-expired) entries
-    pub fn active_entry_count(&self, ttl_ms: u64) -> usize {
-        let entries = self.entries.read();
-        entries.iter().filter(|e| !e.should_cleanup(ttl_ms)).count()
     }
 }
 

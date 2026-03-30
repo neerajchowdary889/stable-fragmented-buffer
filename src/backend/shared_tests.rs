@@ -88,7 +88,7 @@ fn test_chunk_overflow_to_next() {
 fn test_max_chunks_backpressure() {
     let ns = test_namespace();
     let chunk_size = CHUNK_HEADER_SIZE + 64; // 64 bytes of data space
-    // Allow max 2 chunks (chunk 0 + chunk 1)
+                                             // Allow max 2 chunks (chunk 0 + chunk 1)
     let backend = SharedBackend::create(&ns, chunk_size, Some(2)).unwrap();
 
     // Fill chunk 0

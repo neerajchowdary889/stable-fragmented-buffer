@@ -19,7 +19,7 @@
 //!   Data is written to `/dev/shm` chunks and referenced via 24-byte
 //!   `OverflowHandle`s that can be sent through ring buffers or pipes.
 
-use crate::page::Page;
+use crate::page::page::Page;
 use crate::types::Result;
 
 /// Trait for storage backend implementations.
@@ -35,11 +35,6 @@ pub(crate) trait StorageBackend: Send + Sync {
     ///
     /// Time: O(log n) for BTreeMap lookup.
     fn get_page(&self, id: u32) -> Option<&Page>;
-
-    /// Get a mutable reference to a page.
-    ///
-    /// Time: O(log n) for BTreeMap lookup.
-    fn get_page_mut(&mut self, id: u32) -> Option<&mut Page>;
 
     /// Get the total number of pages.
     ///

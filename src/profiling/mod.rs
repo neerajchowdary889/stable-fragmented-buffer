@@ -75,9 +75,17 @@ impl ProfileStats {
     }
 }
 
-/// Profiler - lightweight, lock-free metric tracking
+/// Profiler - lightweight, lock-free metric tracking.
+///
+/// Create via `Profiler::new()` or `Profiler::default()`.
 pub struct Profiler {
     state: Arc<ProfilerState>,
+}
+
+impl Default for Profiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Internal state with atomic counters
@@ -105,8 +113,6 @@ struct ProfilerState {
 }
 
 impl Profiler {
-    /// Create a new profiler with all counters at zero.
-    ///
     /// Time: O(1).
     pub fn new() -> Self {
         Self {

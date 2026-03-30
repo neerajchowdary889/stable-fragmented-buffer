@@ -1,126 +1,188 @@
-# Project Documentation: Pinned Page Store
+# stable-fragmented-buffer
 
-## 1. Executive Summary
+A high-performance, in-memory blob storage system for Rust with **pointer stability** and **cross-process shared memory** support.
 
-**stable fragmented buffer** is a high-performance, in-memory blob storage system designed for Rust. It addresses a specific systems programming challenge: growing a memory buffer dynamically without invalidating existing pointers to that data.
+Unlike `Vec`, which reallocates and moves data on growth, this library chains fixed-size memory chunks — once data is written, its address never changes.
 
-Unlike standard dynamic arrays (e.g., `std::vector` in C++ or Rust), which reallocate and move memory upon growth, Pinned Page Store ensures **Pointer Stability**. Once data is written, its physical address never changes. The primary production mode is **SharedBackend** — a cross-process arena backed by POSIX shared memory (`/dev/shm`) that lets multiple processes read and write the same data with zero-copy access and no OS-level IPC on the hot path.
+## Features
 
----
+- **Pointer Stability** — data never moves after being written
+- **Cross-Process IPC** — shared memory via `/dev/shm` (POSIX `shm_open` + `mmap`)
+- **Lock-Free Writes** — CAS loop on atomic counters, no mutexes on the hot path
+- **Elastic Lifecycle** — proactive prefetch at 80% capacity, lazy decay on scale-down
+- **TTL-Based Expiry** — automatically reclaims chunks even if consumers crash
+- **Backpressure** — configurable `max_chunks` limit prevents `/dev/shm` exhaustion
+- **Crash Recovery** — `cleanup_namespace()` removes orphaned shm files at startup
 
-## 2. Core Architecture
+## Quick Start (Shared Mode)
 
-The system follows a **Layered Monolith** pattern, separating the public safety guarantees from the internal complex allocation strategies.
+```rust
+use stable_fragmented_buffer::{PinnedBlobStore, Config, BlobStoreLifecycleExt};
+use stable_fragmented_buffer::backend::shared::DEFAULT_CHUNK_SIZE;
+use std::sync::Arc;
+use std::time::Duration;
 
-#### 2.1 Architectural Layers
+// Creator process
+let store = Arc::new(PinnedBlobStore::new_shared(
+    Config::default(),
+    "myapp",            // namespace -> /dev/shm/myapp_ctrl, /dev/shm/myapp_data_0, ...
+    DEFAULT_CHUNK_SIZE, // 32 MB per chunk
+)?);
 
-1. **The Public Facade:** A type-safe Rust API ensuring thread safety and pointer lifetimes.
-2. **The Elastic Brain:** A logic layer that manages "when" to allocate or deallocate, decoupled from the actual "write" operations.
-3. **The Storage Backend:** An abstract layer. The primary backend is **SharedBackend** — a cross-process `/dev/shm` arena. A single-process **SegmentedBackend** is also available for local use.
+// Start background cleanup (recycles acked + TTL-expired chunks)
+store.start_cleanup(Duration::from_millis(100));
 
-### 2.2 System Diagram
+// Write data — returns a 24-byte handle (not a pointer)
+let handle = store.append_shared(b"hello world")?;
 
-```plaintext
-+-------------------------------------------------------------+
-|               PinnedBlobStore (Public API)                  |
-|  append_shared(data) -> OverflowHandle  (creator/attacher)  |
-|  resolve(&handle) -> &[u8]             (zero-copy mmap)     |
-|  acknowledge_shared(&handle)           (mark consumed)      |
-|  cleanup_shared()                      (recycle chunks)     |
-+------------------------------+------------------------------+
-                               |
-                               v
-+-------------------------------------------------------------+
-|              Elastic Lifecycle Manager (The Brain)          |
-|                                                             |
-|   +-----------------------+     +-----------------------+   |
-|   |   GrowthController    |     |     DecayManager      |   |
-|   | (Rapid Scale-Up)      |     | (Slow Scale-Down)     |   |
-|   +-----------------------+     +-----------------------+   |
-|   | Trigger:              |     | Trigger:              |   |
-|   |  Chunk full           |     |  Chunk fully acked AND|   |
-|   |  → allocate new chunk |     |  Age > decay_timeout  |   |
-|   +----------+------------+     +-----------+-----------+   |
-|              |                              |               |
-|              v (new /dev/shm chunk)         v (recycle)     |
-+--------------+------------------------------+---------------+
-                               |
-                               v
-+-------------------------------------------------------------+
-|            SharedBackend (Primary — /dev/shm)               |
-|                                                             |
-|  /dev/shm/{ns}_ctrl          128-byte control file         |
-|    magic · version · chunk_size                             |
-|    write_head (AtomicU32) · chunk_count (AtomicU32)         |
-|    generation (AtomicU32)                                   |
-|                                                             |
-|  /dev/shm/{ns}_data_0        32 MB data chunk              |
-|  /dev/shm/{ns}_data_1        32 MB data chunk              |
-|  ...                                                        |
-|                                                             |
-|  Each chunk header (64 bytes):                              |
-|    used · generation · entry_count · ack_count · empty_since|
-|                                                             |
-|  Synchronisation: atomics embedded in mmap (no syscalls)   |
-+-------------------------------------------------------------+
+// Read data — returns an owned copy safe from concurrent cleanup
+let data = store.resolve(&handle).unwrap();
+assert_eq!(data, b"hello world");
+
+// Mark as consumed — enables cleanup
+store.acknowledge_shared(&handle);
 ```
 
----
+```rust
+// Attacher process (any number of processes can attach)
+let store = PinnedBlobStore::attach_shared(Config::default(), "myapp")?;
 
-## 3. Key Features & Algorithms
+// Resolve the same handle (received via ring buffer, pipe, etc.)
+if let Some(data) = store.resolve(&handle) {
+    process(&data);
+    store.acknowledge_shared(&handle);
+}
+```
 
-### 3.1 Pointer Stability
+## Architecture
 
-Standard vectors grow by allocating a larger block and moving all data to it, invalidating old pointers. Pinned Page Store grows by allocating new fixed-size chunks.
+```
+┌─────────────────────────────────────────────────────┐
+│           PinnedBlobStore (Public API)               │
+│  append_shared() -> OverflowHandle                  │
+│  resolve() -> Option<Vec<u8>>                       │
+│  acknowledge_shared()    cleanup_shared()           │
+├─────────────────────────────────────────────────────┤
+│        LifecycleManager ("Elastic Brain")           │
+│  Prefetch: pre-alloc next chunk at 80% usage        │
+│  Ack cleanup: free when all entries acked + decay   │
+│  TTL expiry: free when first_write_ts > ttl_ms      │
+│  Real cleanup: shm_unlink + munmap (frees tmpfs)    │
+├─────────────────────────────────────────────────────┤
+│           SharedBackend (/dev/shm)                  │
+│  Control file (128B): magic, write_head, chunk_count│
+│  Data chunks (default 32MB each):                   │
+│    64B header: used, gen, entries, acks, timestamps  │
+│    Data region: raw bytes, CAS-reserved             │
+│  Sync: all via atomics in mmap (no OS IPC)          │
+└─────────────────────────────────────────────────────┘
+```
 
-* **Benefit:** An `OverflowHandle` obtained in one process resolves to valid data in any attached process until the chunk is recycled.
-* **Mechanism:** Data is never moved after it is written into a chunk.
+### How Cleanup Works
 
-### 3.2 Elastic Scaling (Hysteresis)
+A chunk is freed (unlinked from `/dev/shm`) when **either**:
 
-To ensure consistent latency, the system employs an asymmetric growth/decay strategy.
+1. **All entries acknowledged** (`ack_count >= entry_count`) **AND** the `decay_timeout_ms` grace period has elapsed — this is the normal path.
 
-* **Rapid Scale-Up:** When the active chunk is full, the writer immediately allocates a new `/dev/shm` chunk (or reuses a recycled one) and advances `write_head`.
-* **Slow Scale-Down (The Decay Rule):** A chunk whose `ack_count >= entry_count` is not freed immediately. It is only recycled (header reset, new generation) after it has been fully acknowledged for at least `decay_timeout_ms` (default 5 s). This prevents thrashing at workload boundaries.
-* **Chunk Recycling:** Before allocating a fresh chunk, the writer scans for existing chunks with `used == 0 && entry_count == 0` and reuses them, keeping the file count compact.
+2. **TTL expired** (`now - first_write_ts > default_ttl_ms`) regardless of acknowledgement state — this handles the case where a consumer crashes and never acks. Without this, the chunk would be stuck forever.
 
-### 3.3 SharedBackend — Cross-Process Design
+Freed chunks are truly removed: `shm_unlink` is called (freeing tmpfs memory), the mmap is unmapped, and the chunk is removed from the in-memory `BTreeMap`. New data is written to freshly allocated chunks.
 
-All synchronisation happens via atomics embedded directly in the mmap region — no mutexes, semaphores, or futexes on the hot write path.
+### Proactive Prefetch
 
-#### Control File Layout (`{ns}_ctrl`, 128 bytes)
+When an `append_shared()` pushes a chunk past 80% capacity, the **next** chunk is pre-allocated (`shm_open` + `ftruncate` + `mmap`) in the background. This means the writer that eventually overflows finds the chunk already mapped — no syscall on the hot path.
 
-| Offset | Field         | Size | Description                          |
-|--------|---------------|------|--------------------------------------|
-| 0      | `magic`       | 8    | `0x444D58505F4F5646` ("DMXP_OVF")   |
-| 8      | `version`     | 4    | Protocol version (1)                 |
-| 12     | `chunk_size`  | 4    | Bytes per data chunk                 |
-| 16     | `write_head`  | 4    | Active chunk ID (`AtomicU32`)        |
-| 20     | `chunk_count` | 4    | Highest allocated chunk + 1          |
-| 24     | `generation`  | 4    | Global generation counter            |
-| 28     | _(reserved)_  | 100  | Pad to 128 bytes                     |
+Benchmark impact: max append latency dropped from **103us to 20us**, throughput from **4.2 GB/s to 9.2 GB/s**.
 
-#### Chunk Header Layout (first 64 bytes of each `{ns}_data_N`)
+### Crash Recovery
 
-| Offset | Field          | Size | Description                              |
-|--------|----------------|------|------------------------------------------|
-| 0      | `used`         | 4    | Bytes written (`AtomicU32`, CAS target)  |
-| 4      | `generation`   | 4    | Recycling generation (`AtomicU32`)       |
-| 8      | `entry_count`  | 4    | Total entries appended (`AtomicU32`)     |
-| 12     | `ack_count`    | 4    | Acknowledged entries (`AtomicU32`)       |
-| 16     | `empty_since`  | 8    | Timestamp when fully acked (`AtomicU64`) |
-| 24     | _(reserved)_   | 40   | Pad to 64 bytes                          |
+If the creator process is killed (SIGKILL, OOM), `/dev/shm` files are orphaned because `Drop` never runs. Call this at application startup:
 
-Data starts at byte 64 of each chunk.
+```rust
+use stable_fragmented_buffer::SharedBackend;
 
----
+// Unlinks all /dev/shm files for this namespace (safe if they don't exist)
+SharedBackend::cleanup_namespace("myapp").unwrap();
+```
 
-## 4. Configuration Specification
+## Memory Layout
 
-| Parameter              | Recommended (Performance) | Recommended (Memory) | Description                          |
-|------------------------|---------------------------|----------------------|--------------------------------------|
-| `page_size`            | 2 MB                      | 512 KB               | Heap page size (single-process mode) |
-| `prefetch_threshold`   | 0.8 (80%)                 | 0.95 (95%)           | When to trigger next allocation      |
-| `decay_timeout_ms`     | 5000 ms                   | 1000 ms              | How long to keep empty chunks alive  |
-| `default_ttl_ms`       | 30 000 ms                 | 10 000 ms            | Handle TTL before expiry             |
-| `chunk_size` (shared)  | 32 MB (default)           | 4–8 MB               | Size of each `/dev/shm` data chunk   |
+### Control File (`/dev/shm/{ns}_ctrl`, 128 bytes)
+
+| Offset | Field | Size | Type | Description |
+|--------|-------|------|------|-------------|
+| 0 | `magic` | 8 | u64 | `0x444D58505F4F5646` ("DMXP_OVF") |
+| 8 | `version` | 4 | u32 | Protocol version (1) |
+| 12 | `chunk_size` | 4 | u32 | Bytes per data chunk |
+| 16 | `write_head` | 4 | AtomicU32 | Active chunk ID for appends |
+| 20 | `chunk_count` | 4 | AtomicU32 | Highest allocated chunk + 1 |
+| 24 | `generation` | 4 | AtomicU32 | Global generation counter |
+| 28 | _(reserved)_ | 100 | - | Pad to 128 bytes |
+
+### Chunk Header (first 64 bytes of each `/dev/shm/{ns}_data_N`)
+
+| Offset | Field | Size | Type | Description |
+|--------|-------|------|------|-------------|
+| 0 | `used` | 4 | AtomicU32 | Bytes written (CAS target for append) |
+| 4 | `generation` | 4 | AtomicU32 | Recycling generation (ABA prevention) |
+| 8 | `entry_count` | 4 | AtomicU32 | Total entries appended |
+| 12 | `ack_count` | 4 | AtomicU32 | Acknowledged entries |
+| 16 | `empty_since` | 8 | AtomicU64 | Timestamp when all entries were acked |
+| 24 | `first_write_ts` | 8 | AtomicU64 | Timestamp of first append (for TTL expiry) |
+| 32 | _(reserved)_ | 32 | - | Pad to 64 bytes |
+
+Data region starts at byte 64.
+
+## Configuration
+
+```rust
+pub struct Config {
+    pub page_size: usize,        // Heap page size (default: 1 MB)
+    pub prefetch_threshold: f32, // Pre-alloc next chunk at this usage (default: 0.8)
+    pub decay_timeout_ms: u64,   // Grace period before freeing acked chunks (default: 5000)
+    pub default_ttl_ms: u64,     // Auto-expire unacked data after this (default: 30000)
+}
+```
+
+| Preset | Page Size | Prefetch | Decay | TTL |
+|--------|-----------|----------|-------|-----|
+| `Config::default()` | 1 MB | 80% | 5 s | 30 s |
+| `Config::performance()` | 2 MB | 80% | 7 s | 30 s |
+| `Config::memory_efficient()` | 512 KB | 90% | 1 s | 30 s |
+
+SharedBackend-specific: `chunk_size` is passed to `new_shared()` (default 32 MB). `max_chunks` is passed to `new_shared_with_limit()` (default unlimited).
+
+## Capacity Limits
+
+| Constraint | Limit | Notes |
+|-----------|-------|-------|
+| Max chunks | u32::MAX - 1 (~4B) | Or `max_chunks` config |
+| Max chunk size | 4 GB (u32::MAX) | Stored as u32 in control file |
+| Max single append | chunk_size - 64 bytes | Shared mode doesn't span chunks |
+| Default data per chunk | ~33.5 million bytes | 32 MB - 64B header |
+| Practical limit | 50% of RAM | `/dev/shm` is tmpfs on Linux |
+
+## Tests
+
+33 unit tests + 2 doc-tests covering:
+- Basic CRUD, multi-chunk overflow, cross-process attach
+- Ack-based cleanup, partial ack safety, decay timeout
+- TTL-based expiry (consumer crash scenario)
+- Proactive prefetch triggering and latency reduction
+- Real `/dev/shm` file unlink verification
+- Background lifecycle thread integration
+- Concurrent append + cleanup safety
+- Active chunk corruption protection
+
+```bash
+cargo test                              # All tests
+cargo test lifecycle -- --nocapture     # Lifecycle tests with step-by-step trace
+```
+
+## Performance (Apple M-series, release mode)
+
+| Operation | Throughput | p50 | p99 | max |
+|-----------|-----------|-----|-----|-----|
+| `append_shared` | 9.2 GB/s | 0.2 us | 2.0 us | 20.9 us |
+| `resolve` | 8.3 GB/s | 0.4 us | 1.5 us | 2.9 us |
+| `acknowledge_shared` | - | 0.0 us | 0.0 us | 0.5 us |

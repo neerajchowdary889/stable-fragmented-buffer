@@ -148,10 +148,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            page_size: 1 * 1024 * 1024, // 1MB
-            prefetch_threshold: 0.8,    // 80%
-            decay_timeout_ms: 5000,     // 5 seconds
-            default_ttl_ms: 30000,      // 30 seconds
+            page_size: 1024 * 1024,  // 1MB
+            prefetch_threshold: 0.8, // 80%
+            decay_timeout_ms: 5000,  // 5 seconds
+            default_ttl_ms: 30000,   // 30 seconds
         }
     }
 }

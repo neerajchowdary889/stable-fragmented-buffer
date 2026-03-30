@@ -39,14 +39,17 @@ fn main() {
     println!();
 
     let config = Config {
-        default_ttl_ms: 60_000,     // 60s TTL
-        decay_timeout_ms: 500,      // 500ms decay
+        default_ttl_ms: 60_000, // 60s TTL
+        decay_timeout_ms: 500,  // 500ms decay
         ..Config::default()
     };
 
     // ── Phase 1: Create store + append (trigger multi-chunk) ─────────
 
-    println!("━━━ Phase 1: Append {} messages (trigger multi-chunk creation) ━━━", NUM_MESSAGES);
+    println!(
+        "━━━ Phase 1: Append {} messages (trigger multi-chunk creation) ━━━",
+        NUM_MESSAGES
+    );
 
     let store = Arc::new(
         PinnedBlobStore::new_shared(config.clone(), NAMESPACE, CHUNK_SIZE)
@@ -68,9 +71,19 @@ fn main() {
 
     let chunks_used = handles.last().unwrap().page_id + 1;
 
-    println!("  ✓ Appended {} messages in {:.2?}", NUM_MESSAGES, phase1_elapsed);
-    println!("  ✓ Chunks created: {} (expected ≥ {})", chunks_used, TOTAL_DATA / CHUNK_SIZE);
-    println!("  ✓ Throughput: {:.1} MB/s", (TOTAL_DATA as f64 / 1e6) / phase1_elapsed.as_secs_f64());
+    println!(
+        "  ✓ Appended {} messages in {:.2?}",
+        NUM_MESSAGES, phase1_elapsed
+    );
+    println!(
+        "  ✓ Chunks created: {} (expected ≥ {})",
+        chunks_used,
+        TOTAL_DATA / CHUNK_SIZE
+    );
+    println!(
+        "  ✓ Throughput: {:.1} MB/s",
+        (TOTAL_DATA as f64 / 1e6) / phase1_elapsed.as_secs_f64()
+    );
 
     append_times.sort();
     print_percentiles("  Append", &append_times);
@@ -78,7 +91,10 @@ fn main() {
 
     // ── Phase 2: Resolve all handles (zero-copy read) ────────────────
 
-    println!("━━━ Phase 2: Resolve {} handles (zero-copy read) ━━━", NUM_MESSAGES);
+    println!(
+        "━━━ Phase 2: Resolve {} handles (zero-copy read) ━━━",
+        NUM_MESSAGES
+    );
 
     let mut resolve_times: Vec<Duration> = Vec::with_capacity(NUM_MESSAGES);
     let mut resolve_ok = 0usize;
@@ -101,8 +117,14 @@ fn main() {
     }
     let phase2_elapsed = phase2_start.elapsed();
 
-    println!("  ✓ Resolved {} ok, {} failed in {:.2?}", resolve_ok, resolve_fail, phase2_elapsed);
-    println!("  ✓ Read throughput: {:.1} MB/s", (TOTAL_DATA as f64 / 1e6) / phase2_elapsed.as_secs_f64());
+    println!(
+        "  ✓ Resolved {} ok, {} failed in {:.2?}",
+        resolve_ok, resolve_fail, phase2_elapsed
+    );
+    println!(
+        "  ✓ Read throughput: {:.1} MB/s",
+        (TOTAL_DATA as f64 / 1e6) / phase2_elapsed.as_secs_f64()
+    );
 
     resolve_times.sort();
     print_percentiles("  Resolve", &resolve_times);
@@ -127,7 +149,10 @@ fn main() {
     }
     let phase3_elapsed = phase3_start.elapsed();
 
-    println!("  ✓ Process B resolved {}/{} handles in {:.2?}", cross_process_ok, NUM_MESSAGES, phase3_elapsed);
+    println!(
+        "  ✓ Process B resolved {}/{} handles in {:.2?}",
+        cross_process_ok, NUM_MESSAGES, phase3_elapsed
+    );
 
     // Drop Process B's reference before cleanup
     drop(store_b);
@@ -146,7 +171,10 @@ fn main() {
     }
     let phase4_elapsed = phase4_start.elapsed();
 
-    println!("  ✓ Acknowledged {} entries in {:.2?}", NUM_MESSAGES, phase4_elapsed);
+    println!(
+        "  ✓ Acknowledged {} entries in {:.2?}",
+        NUM_MESSAGES, phase4_elapsed
+    );
     ack_times.sort();
     print_percentiles("  Ack", &ack_times);
     println!();
@@ -180,7 +208,9 @@ fn main() {
     let new_payload = vec![0xCDu8; PAYLOAD_SIZE];
     let mut new_handles = Vec::with_capacity(100);
     for _ in 0..100 {
-        let handle = store.append_shared(&new_payload).expect("append after recycle failed");
+        let handle = store
+            .append_shared(&new_payload)
+            .expect("append after recycle failed");
         new_handles.push(handle);
     }
 
@@ -195,9 +225,23 @@ fn main() {
             new_ok += 1;
         }
     }
-    println!("  ✓ Wrote and resolved {}/100 new messages after recycling", new_ok);
-    println!("  ✓ Max chunk ID used: {} (was {} before recycling)", max_new_chunk_id, chunks_used - 1);
-    println!("  ✓ Reused old chunk IDs: {}", if reused_old_chunks { "YES ✓" } else { "NO ✗" });
+    println!(
+        "  ✓ Wrote and resolved {}/100 new messages after recycling",
+        new_ok
+    );
+    println!(
+        "  ✓ Max chunk ID used: {} (was {} before recycling)",
+        max_new_chunk_id,
+        chunks_used - 1
+    );
+    println!(
+        "  ✓ Reused old chunk IDs: {}",
+        if reused_old_chunks {
+            "YES ✓"
+        } else {
+            "NO ✗"
+        }
+    );
     println!();
 
     // ── Summary ──────────────────────────────────────────────────────
@@ -205,14 +249,38 @@ fn main() {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                     BENCHMARK SUMMARY                      ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Chunks created:       {:>4}                                ║", chunks_used);
-    println!("║  All appends ok:       {:>4}                                ║", handles.len() == NUM_MESSAGES);
-    println!("║  All resolves ok:      {:>4}                                ║", resolve_ok == NUM_MESSAGES);
-    println!("║  Cross-proc resolves:  {:>4}                                ║", cross_process_ok == NUM_MESSAGES);
-    println!("║  Chunks recycled:      {:>4}                                ║", recycled);
-    println!("║  Stale after cleanup:  {:>4}                                ║", stale_count);
-    println!("║  Chunk IDs reused:     {:>4}                                ║", reused_old_chunks);
-    println!("║  Re-use after recycle: {:>4}                                ║", new_ok == 100);
+    println!(
+        "║  Chunks created:       {:>4}                                ║",
+        chunks_used
+    );
+    println!(
+        "║  All appends ok:       {:>4}                                ║",
+        handles.len() == NUM_MESSAGES
+    );
+    println!(
+        "║  All resolves ok:      {:>4}                                ║",
+        resolve_ok == NUM_MESSAGES
+    );
+    println!(
+        "║  Cross-proc resolves:  {:>4}                                ║",
+        cross_process_ok == NUM_MESSAGES
+    );
+    println!(
+        "║  Chunks recycled:      {:>4}                                ║",
+        recycled
+    );
+    println!(
+        "║  Stale after cleanup:  {:>4}                                ║",
+        stale_count
+    );
+    println!(
+        "║  Chunk IDs reused:     {:>4}                                ║",
+        reused_old_chunks
+    );
+    println!(
+        "║  Re-use after recycle: {:>4}                                ║",
+        new_ok == 100
+    );
     println!("╚══════════════════════════════════════════════════════════════╝");
 
     // Drop triggers automatic shm_unlink — no manual cleanup needed!

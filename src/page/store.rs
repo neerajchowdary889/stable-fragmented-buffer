@@ -242,7 +242,7 @@ impl PinnedBlobStore {
         // Solution: Always allocate a fresh CONTIGUOUS block at the High Water Mark.
 
         let chunk_size = self.config.page_size;
-        let num_pages = (data.len() + chunk_size - 1) / chunk_size;
+        let num_pages = data.len().div_ceil(chunk_size);
 
         // Check for wraparound before reserving contiguous IDs
         let current_hwm = self.high_water_mark.load(Ordering::Acquire);

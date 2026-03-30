@@ -1,5 +1,5 @@
 use crate::backend::StorageBackend;
-use crate::page::Page;
+use crate::page::page::Page;
 use crate::types::Result;
 use std::collections::BTreeMap;
 
@@ -35,10 +35,6 @@ impl StorageBackend for SegmentedBackend {
 
     fn get_page(&self, id: u32) -> Option<&Page> {
         self.pages.get(&id)
-    }
-
-    fn get_page_mut(&mut self, id: u32) -> Option<&mut Page> {
-        self.pages.get_mut(&id)
     }
 
     fn page_count(&self) -> usize {
