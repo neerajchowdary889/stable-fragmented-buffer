@@ -866,10 +866,33 @@ impl SharedBackend {
         let c_name = CString::new(shm_name.as_str()).map_err(|_| BlobError::OutOfMemory)?;
 
         let fd: RawFd = if create {
-            let fd =
-                unsafe { libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+            // Try to create exclusively first. If a stale file exists
+            // (e.g. from a previous crash), unlink it and retry.
+            // This handles macOS where ftruncate on an existing shm
+            // object with a different size fails with EINVAL.
+            let mut fd = unsafe {
+                libc::shm_open(
+                    c_name.as_ptr(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                    0o600,
+                )
+            };
             if fd < 0 {
-                return Err(BlobError::OutOfMemory);
+                let errno = std::io::Error::last_os_error();
+                if errno.raw_os_error() == Some(libc::EEXIST) {
+                    // Stale file from a previous run — unlink and retry
+                    unsafe { libc::shm_unlink(c_name.as_ptr()) };
+                    fd = unsafe {
+                        libc::shm_open(
+                            c_name.as_ptr(),
+                            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                            0o600,
+                        )
+                    };
+                }
+                if fd < 0 {
+                    return Err(BlobError::OutOfMemory);
+                }
             }
             if unsafe { libc::ftruncate(fd, size as i64) } != 0 {
                 unsafe { libc::close(fd) };
